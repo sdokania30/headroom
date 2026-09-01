@@ -35,6 +35,7 @@ from .pipeline import (
     build_instruments,
     build_prices,
 )
+from .preflight import render, run_preflight
 from .timing import EventTimingEngine
 from .utils import Journal, read_jsonl
 
@@ -67,6 +68,14 @@ async def _run_pipeline(settings: Settings, mode: str) -> int:
         feeds = build_feeds(settings, client)
         engine = build_engine_for(settings)
         prices = build_prices(settings, client)
+
+        if mode == "live":
+            checks = await run_preflight(settings, live=True, client=client)
+            report, code = render(checks)
+            print(report)
+            if code:
+                log.error("pre-flight failed - refusing to start a live session")
+                return 2
 
         router = None
         positions = None
@@ -267,11 +276,27 @@ def _latency_report(journal_path: str) -> int:
     return 0
 
 
+async def _preflight(settings: Settings, live: bool) -> int:
+    client = build_client()
+    try:
+        checks = await run_preflight(settings, live=live, client=client)
+    finally:
+        await client.aclose()
+    report, code = render(checks)
+    print(report)
+    return code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="newsalpha", description=__doc__)
     parser.add_argument("-c", "--config", help="path to config.yaml")
     parser.add_argument("--log-level", default="")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    preflight = sub.add_parser("preflight", help="check readiness before trading")
+    preflight.add_argument(
+        "--live", action="store_true", help="apply the stricter live-trading checks"
+    )
 
     sub.add_parser("scan", help="score filings without trading")
     sub.add_parser("paper", help="trade against the paper broker")
@@ -299,6 +324,8 @@ def main(argv: list[str] | None = None) -> int:
         return _latency_report(args.journal)
 
     try:
+        if args.command == "preflight":
+            return asyncio.run(_preflight(settings, args.live))
         if args.command == "capture":
             return asyncio.run(_capture(settings, args.out))
         if args.command == "backtest":

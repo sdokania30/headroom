@@ -76,6 +76,11 @@ def first(row: dict[str, Any], *keys: str, default: str = "") -> str:
     return default
 
 
+def utcnow_ist_str() -> str:
+    """Current time in IST, for human-facing messages."""
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
+
+
 def in_session(moment: datetime, start: str, end: str) -> bool:
     """Is ``moment`` inside the IST intraday window, on a weekday?
 

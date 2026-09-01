@@ -59,6 +59,9 @@ Requires Python 3.10+.
 ## Use
 
 ```bash
+# 0. Check readiness. Run this before anything that can trade.
+newsalpha -c config.yaml preflight --live
+
 # 1. Score live filings, place nothing. Only needs ANTHROPIC_API_KEY.
 newsalpha -c config.yaml scan
 
@@ -80,6 +83,13 @@ newsalpha latency-report -j journal/timing.jsonl
 
 Start at `scan`. Do not skip step 2 — a strategy validated on somebody else's
 captured data is not validated.
+
+`preflight` checks the things that otherwise fail silently: a missing instrument
+master (no NSE signal is routable, and it looks like a quiet day), an empty
+holiday list, a risk budget that makes the per-trade cap bind at every confidence
+level so every trade goes on at maximum size, a daily loss limit smaller than
+what the book can lose in one move. `live` runs it automatically and refuses to
+start on any failure.
 
 ---
 
@@ -149,6 +159,23 @@ holidays), square-off buffer, denylist, price band, daily loss limit, order rate
 limit, position caps, gross notional headroom, consecutive-reject kill switch.
 Every rejection carries a specific reason.
 
+Two properties that took several attempts to get right, both found by testing
+rather than by reading:
+
+**The caps hold under concurrency.** Filings are handled in parallel, so every
+check used to sit between an approval and a fill with an `await` in between — a
+time-of-check/time-of-use race on all of them. A simulated results-day burst
+opened *twice* the position cap, and four filings on one symbol placed four
+orders. Approval now reserves capacity synchronously, with no `await` between the
+checks and the reservation; open-position counts and gross notional include
+in-flight orders, and every exit path returns the reservation.
+
+**The loss limit counts open positions.** A limit measured only on realised P&L
+lets you keep opening trades while deeply underwater — the exact situation it
+exists to stop. The position manager marks open positions every tick, pricing
+before marking so the kill switch fires on the move that tripped it rather than
+one poll later.
+
 Sizing is risk-parity — the stop distance sets the size, not the price — scaled by
 the model's confidence, then clamped by the per-trade cap and remaining headroom,
 and finally rounded down to a whole lot.
@@ -164,7 +191,9 @@ missing the trade.
 Dhan `securityId`. `InstrumentMaster` resolves it from Dhan's scrip master, and
 also supplies the lot size and tick size that orders are rounded to. Without it
 every NSE-sourced signal is unroutable — and the failure looks like a quiet day
-rather than a bug.
+rather than a bug. Resolution also canonicalises the symbol, so the same company
+filing on both exchanges ("Infosys Ltd" from BSE, "INFY" from NSE) collapses to
+one position instead of two.
 
 `PositionManager` closes what the router opens, checking four exits in priority
 order on every tick:
@@ -181,6 +210,11 @@ most want to be flat. And a **failed exit is retried and escalated, never
 dropped**: retry with backoff, then log at ERROR, journal it, and trip the risk
 halt so nothing new opens while a position is stuck. It stays registered so the
 next tick tries again.
+
+**A position is exited exactly once.** A shutdown flatten used to run alongside
+the manager's own tick, and both could reach the same position — two exits on a
+10-share long leaves you 10 short, which is not flat. `_close` now does an atomic
+check-and-set, and shutdown stops the manager before flattening.
 
 Live trading needs two independent switches (`broker: dhan` *and*
 `live_trading_armed: true`). One flag is too easy to leave set in a config you
@@ -249,7 +283,7 @@ Honest list of what is *not* done, in rough order of how much it matters:
    of truth between polls. A fill that happens outside this process — a manual
    trade, a broker-side square-off, a partial fill topped up later — will not be
    seen. Reconcile against the positions endpoint on startup and periodically
-   before trading real size.
+   before trading real size. This is the largest remaining gap for live use.
 3. **Partial fills are treated as whole.** `confirm` reads the traded quantity,
    but a partially-filled entry is managed as if complete and the residual order
    is not cancelled.
@@ -276,6 +310,7 @@ src/newsalpha/
   clock.py          per-stage stopwatch, rolling percentiles
   utils.py          IST handling, tolerant field access, JSONL journal
   sessions.py       trading calendar: holidays, square-off, time to close
+  preflight.py      readiness checks; live refuses to start if these fail
   ingest/           feed loop, BSE/NSE/Dhan adapters, dedupe, replay,
                     instrument master (symbol -> securityId, lot, tick)
   sentiment/        regex prescreen, Claude engine
@@ -283,7 +318,8 @@ src/newsalpha/
   execution/        risk gates, order router, position manager, paper + Dhan brokers
   backtest/         bar store, replay engine, delay sweep, metrics
   pipeline.py       the live wiring
-  cli.py            scan / capture / paper / live / backtest / latency-report
+  cli.py            preflight / scan / capture / paper / live / backtest /
+                    latency-report
 ```
 
 ## Licence
