@@ -81,10 +81,11 @@ class BseAnnouncementFeed(PollingFeed):
         return Announcement(
             uid=make_uid("bse", first(row, "NEWSID", "NEWS_ID"), headline),
             source="bse",
-            # BSE keys by numeric scrip code; SLONGNAME is the company name. The
-            # scrip code is what maps to a tradable instrument, so it is the
-            # symbol of record and the name is kept for humans reading the journal.
-            symbol=first(row, "NSURL", "SLONGNAME", default=scrip) or scrip,
+            # SLONGNAME is the company name; NSURL is a link to the filing and is
+            # emphatically not an identifier. The scrip code is what maps to a
+            # tradable instrument, so it is carried in security_id and the
+            # instrument master supplies the canonical trading symbol later.
+            symbol=first(row, "SLONGNAME", "SC_NAME", default=scrip) or scrip,
             security_id=scrip,
             exchange_segment="BSE_EQ",
             headline=headline,

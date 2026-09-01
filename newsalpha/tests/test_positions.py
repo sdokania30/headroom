@@ -348,3 +348,42 @@ async def test_closing_an_unmanaged_position_is_a_no_op():
     position.closing = False  # pretend a stale caller still holds it
     await manager._close(position, 98.0, "STALE")
     assert len(broker.placed) == 1
+
+
+async def test_open_losses_count_towards_the_daily_limit():
+    """A loss limit that only sees closed trades lets you keep opening positions
+    while deeply underwater - the exact situation it exists to stop."""
+    manager, _, risk = build(price=100.0, daily_loss_limit=500.0, max_hold_minutes=600)
+    open_position(manager, risk, quantity=100)  # 100 shares at 100
+
+    assert not risk.halted
+
+    # Price falls 6%: 600 down on open positions, past the 500 limit. The stop
+    # would also fire here - the point is that the account halts on the mark,
+    # before the exit has been booked.
+    manager._prices.price = 94.0
+    await manager.tick(NOW)
+
+    assert risk.halted
+    assert "incl. open" in risk.halt_reason or "open" in risk.halt_reason
+
+
+async def test_mark_to_market_is_reported_every_tick():
+    manager, _, risk = build(price=101.0, max_hold_minutes=600)
+    open_position(manager, risk, quantity=10)
+    await manager.tick(NOW)
+
+    # 10 shares, entry 100, marked at 101.
+    assert risk.unrealised_pnl == pytest.approx(10.0)
+    assert risk.total_pnl == pytest.approx(10.0)
+
+
+async def test_the_mark_clears_when_the_position_closes():
+    manager, _, risk = build(price=102.5, max_hold_minutes=600)
+    open_position(manager, risk, quantity=10)
+    await manager.tick(NOW)  # target hit, position closed
+
+    assert risk.positions == {}
+    await manager.tick(NOW)  # nothing open -> mark must go back to zero
+    assert risk.unrealised_pnl == pytest.approx(0.0)
+    assert risk.realised_pnl == pytest.approx(25.0)

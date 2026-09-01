@@ -62,6 +62,11 @@ class RiskEngine:
         # precisely the moment they are needed.
         self._pending: dict[str, float] = {}
         self.realised_pnl: float = 0.0
+        # Mark-to-market on open positions, refreshed by the position manager.
+        # The daily loss limit counts this too: a limit that only sees closed
+        # trades does not stop you opening more while deeply underwater, which
+        # is the exact situation it exists to stop.
+        self.unrealised_pnl: float = 0.0
         self.consecutive_rejects: int = 0
         self.halted: bool = False
         self.halt_reason: str = ""
@@ -107,8 +112,8 @@ class RiskEngine:
         if not (self._cfg.min_price <= price <= self._cfg.max_price):
             return RiskDecision(False, f"price {price:.2f} outside tradable band")
 
-        if self.realised_pnl <= -self._cfg.daily_loss_limit:
-            self.halt(f"daily loss limit hit ({self.realised_pnl:.0f})")
+        if self.total_pnl <= -self._cfg.daily_loss_limit:
+            self.halt(f"daily loss limit hit ({self.total_pnl:.0f} incl. open positions)")
             return RiskDecision(False, self.halt_reason)
 
         if self._orders_last_minute(now) >= self._cfg.max_orders_per_minute:
@@ -202,9 +207,30 @@ class RiskEngine:
     def book_pnl(self, pnl: float) -> float:
         """Add to the day's realised P&L, tripping the kill switch if breached."""
         self.realised_pnl += pnl
-        if self.realised_pnl <= -self._cfg.daily_loss_limit:
-            self.halt(f"daily loss limit hit ({self.realised_pnl:.0f})")
+        self._check_loss_limit()
         return pnl
+
+    @property
+    def total_pnl(self) -> float:
+        """Realised plus open. This is the number the loss limit is measured on."""
+        return self.realised_pnl + self.unrealised_pnl
+
+    def mark_to_market(self, unrealised: float) -> None:
+        """Report the current value of open positions.
+
+        Called by the position manager on every tick. This is what lets the kill
+        switch fire while a losing position is still open, instead of only after
+        it has been closed and the damage is already done.
+        """
+        self.unrealised_pnl = unrealised
+        self._check_loss_limit()
+
+    def _check_loss_limit(self) -> None:
+        if self.total_pnl <= -self._cfg.daily_loss_limit:
+            self.halt(
+                f"daily loss limit hit ({self.total_pnl:.0f} = "
+                f"{self.realised_pnl:.0f} realised + {self.unrealised_pnl:.0f} open)"
+            )
 
     def release(self, symbol: str) -> None:
         """Give back capacity reserved by an order that never became a position.
@@ -244,6 +270,7 @@ class RiskEngine:
             log.info("new session %s: resetting daily P&L and halt state", today)
             self._day = today
             self.realised_pnl = 0.0
+            self.unrealised_pnl = 0.0
             self.consecutive_rejects = 0
             self._pending.clear()
             self.halted = False
@@ -257,5 +284,7 @@ class RiskEngine:
             "pending_orders": len(self._pending),
             "gross_notional": round(self.gross_notional, 2),
             "realised_pnl": round(self.realised_pnl, 2),
+            "unrealised_pnl": round(self.unrealised_pnl, 2),
+            "total_pnl": round(self.total_pnl, 2),
             "consecutive_rejects": self.consecutive_rejects,
         }

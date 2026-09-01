@@ -178,7 +178,24 @@ class PositionManager:
     async def tick(self, now: datetime | None = None) -> None:
         now = now or utcnow()
         if not self._positions:
+            # Clear the mark: nothing open means no open exposure, and a stale
+            # figure here would sit in the daily loss limit indefinitely.
+            self._risk.mark_to_market(0.0)
             return
+
+        # Price everything first, then mark, then decide. Marking before the
+        # refresh would report the previous tick's prices, so the kill switch
+        # would always be one poll behind the move that tripped it.
+        prices: dict[str, float | None] = {}
+        for position in list(self._positions.values()):
+            if position.closing:
+                continue
+            price = await self._price(position)
+            if price is not None:
+                position.last_price = price
+            prices[position.symbol] = price
+
+        self._mark_to_market()
 
         halted = self._risk.halted
         square_off = self._calendar.closing_soon(now, self._risk_cfg.square_off_buffer_s)
@@ -186,12 +203,9 @@ class PositionManager:
         for position in list(self._positions.values()):
             if position.closing:
                 continue
+            price = prices.get(position.symbol)
 
-            price = await self._price(position)
-            if price is not None:
-                position.last_price = price
-
-            # 1 and 2 do not need a price - they must fire even when the quote
+            # These two do not need a price - they must fire even when the quote
             # feed is down, which is exactly when you most want to be flat.
             if halted:
                 await self._close(position, price or position.last_price, "RISK_HALT")
@@ -204,7 +218,8 @@ class PositionManager:
                 # A position we cannot price is a position we cannot manage. Not
                 # fatal on its own - quotes drop out - but it must be visible.
                 log.warning(
-                    "no price for open position %s; stop/target not evaluated", position.symbol
+                    "no price for open position %s; stop/target not evaluated",
+                    position.symbol,
                 )
                 if position.expired(now):
                     await self._close(position, position.last_price, "TIME_NO_PRICE")
@@ -218,6 +233,19 @@ class PositionManager:
                 await self._close(position, price, "TIME")
 
     # -- internals ------------------------------------------------------------
+
+    def _mark_to_market(self) -> None:
+        """Report open-position P&L at the last price each position saw.
+
+        Uses last_price rather than a fresh quote so the mark never blocks; the
+        prices were refreshed on the previous tick and by the loop below.
+        """
+        total = sum(
+            position.unrealised(position.last_price)
+            for position in self._positions.values()
+            if position.last_price > 0
+        )
+        self._risk.mark_to_market(total)
 
     async def _price(self, position: ManagedPosition) -> float | None:
         try:

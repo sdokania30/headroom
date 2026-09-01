@@ -306,3 +306,29 @@ async def test_gross_notional_counts_in_flight_orders():
 
     assert decision.approved
     assert risk.gross_notional == pytest.approx(decision.notional)
+
+
+async def test_the_same_company_from_two_exchanges_is_one_position():
+    """BSE names it "Infosys Ltd" and NSE names it "INFY". Without canonical
+    symbols that is two positions in one underlying, straight through the
+    one-position-per-name rule - double the intended exposure."""
+    router, broker, risk, _ = build()
+
+    first = await router.handle(signal("INFY"), price=100.0, security_id="", segment="NSE_EQ")
+    second = await router.handle(
+        signal("Infosys Limited"), price=100.0, security_id="1594", segment="NSE_EQ"
+    )
+
+    assert first is not None and first.ok
+    assert second is None, "second exchange's copy must be refused"
+    assert len(broker.placed) == 1
+    assert set(risk.positions) == {"INFY"}
+
+
+async def test_positions_are_keyed_by_the_canonical_symbol():
+    router, broker, risk, positions = build()
+    await router.handle(signal("infy-eq"), price=100.0, security_id="", segment="NSE_EQ")
+
+    assert "INFY" in risk.positions
+    assert "INFY" in positions.open_positions
+    assert broker.placed[0].symbol == "INFY"

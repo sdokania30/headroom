@@ -19,6 +19,7 @@ Every outcome - approved, rejected, unfilled - is journalled.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 from ..config import ExecutionConfig, RiskConfig
 from ..ingest.instruments import Instrument, InstrumentMaster
@@ -58,6 +59,14 @@ class OrderRouter:
             log.info("skip %s: no securityId and symbol not in instrument master", signal.symbol)
             self._record(signal, "unresolved instrument", None, price)
             return None
+
+        if instrument is not None and instrument.symbol != signal.symbol.upper():
+            # Key everything off the canonical trading symbol. Feeds name the same
+            # company differently - BSE sends "Infosys Ltd", NSE sends "INFY" - and
+            # without this the same underlying can be held twice, once per
+            # exchange, straight through the one-position-per-name rule.
+            log.debug("canonical symbol for %s is %s", signal.symbol, instrument.symbol)
+            signal = replace(signal, symbol=instrument.symbol)
 
         if instrument is not None and not instrument.tradable_intraday:
             # Trade-to-trade series settle without intraday netting, so an
