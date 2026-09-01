@@ -1,0 +1,64 @@
+# Copy to config.yaml and edit. No secrets here - those live in the environment.
+
+log_level: INFO
+journal_dir: journal
+
+feeds:
+  bse: true
+  nse: true
+  dhan: false            # only if your Dhan plan exposes an announcements endpoint
+  poll_interval_s: 1.0
+  lookback_minutes: 15
+  http_timeout_s: 3.0
+  # Empty = every symbol. A populated list is a hard allowlist applied at ingest,
+  # which is the cheapest place to cut cost: filtered names never reach the LLM.
+  symbols: []
+  categories: []
+
+sentiment:
+  engine: hybrid         # rules | llm | hybrid  (hybrid = regex prescreen + Claude)
+  model: claude-opus-5
+  effort: low            # latency-sensitive path; raise to medium if quality lags
+  timeout_s: 6.0
+  max_concurrency: 8
+  min_prescreen_weight: 0.5
+  min_confidence: 0.65
+  min_materiality: 3
+  fallback_to_rules: false
+
+risk:
+  equity: 1000000
+  risk_per_trade_pct: 0.002      # 0.2% of equity risked per trade.
+                                 # Sizing is risk/stop_loss_pct, so this asks for
+                                 # 20% of equity at a 1% stop - right at the cap
+                                 # below, which is where you want it: the cap then
+                                 # binds only at top confidence instead of always.
+  max_notional_per_trade: 200000
+  max_gross_notional: 1000000
+  max_open_positions: 5
+  stop_loss_pct: 0.01
+  take_profit_pct: 0.02
+  daily_loss_limit: 25000
+  max_consecutive_rejects: 5
+  max_orders_per_minute: 10
+  session_start: "09:20"         # IST. Deliberately after the opening auction.
+  session_end: "15:10"           # and before the square-off scramble.
+  min_price: 20
+  max_price: 100000
+  denylist: []
+
+execution:
+  broker: paper                  # paper | dhan
+  order_type: MARKET
+  product_type: INTRADAY
+  slippage_bps: 8.0
+  live_trading_armed: false      # second switch; both must be set for real orders
+
+backtest:
+  announcements_path: data/announcements.jsonl
+  bars_path: data/bars
+  execution_delay_s: 2.0
+  delay_sweep_s: [0.0, 1.0, 5.0, 30.0, 300.0]
+  hold_minutes: 30
+  cost_bps: 12.0                 # brokerage + STT + impact, both legs
+  cache_path: data/sentiment_cache.jsonl
