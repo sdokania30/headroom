@@ -130,6 +130,15 @@ class TradingPipeline:
             await asyncio.gather(*list(self._inflight), return_exceptions=True)
 
         if self._positions is not None:
+            # Stop the manager and wait for its current tick to finish BEFORE
+            # flattening. Flattening alongside a live tick means two callers can
+            # exit the same position, which does not leave you flat - it leaves
+            # you the same size the other way round.
+            self._positions.stop()
+            if manager_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(manager_task, timeout=10.0)
+
             open_now = len(self._positions.open_positions)
             if open_now and self._cfg.execution.flatten_on_shutdown:
                 log.warning("flattening %d open position(s) before shutdown", open_now)
@@ -141,10 +150,6 @@ class TradingPipeline:
                     "flatten_on_shutdown disabled - nothing is watching their stops",
                     open_now,
                 )
-            self._positions.stop()
-            if manager_task is not None:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await asyncio.wait_for(manager_task, timeout=10.0)
 
         for feed in self._feeds:
             with contextlib.suppress(Exception):

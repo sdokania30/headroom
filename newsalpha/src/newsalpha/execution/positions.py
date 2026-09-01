@@ -170,6 +170,8 @@ class PositionManager:
     async def flatten_all(self, reason: str) -> None:
         """Close everything now. Used on shutdown and on a risk halt."""
         for position in list(self._positions.values()):
+            if position.closing:
+                continue
             price = await self._price(position) or position.last_price
             await self._close(position, price, reason)
 
@@ -227,7 +229,20 @@ class PositionManager:
             return None
 
     async def _close(self, position: ManagedPosition, price: float, reason: str) -> None:
-        """Send the exit, retrying before giving up - and never giving up quietly."""
+        """Send the exit, retrying before giving up - and never giving up quietly.
+
+        The guard below is load-bearing. Two callers can reach a position at once -
+        the manager's own tick and a shutdown flatten - and without it both would
+        send an exit, turning a flat position into an equal and opposite one. The
+        check and the set have no await between them, so under asyncio they are
+        atomic and the second caller returns immediately.
+        """
+        if position.closing:
+            log.debug("%s is already being closed; ignoring duplicate %s", position.symbol, reason)
+            return
+        if self._positions.get(position.symbol) is not position:
+            log.debug("%s is no longer managed; ignoring %s", position.symbol, reason)
+            return
         position.closing = True
         intent = OrderIntent(
             uid=f"{position.uid}:exit",

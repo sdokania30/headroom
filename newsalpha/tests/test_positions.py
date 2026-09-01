@@ -281,3 +281,70 @@ async def test_diverged_records_still_book_the_pnl(caplog):
 
     assert risk.realised_pnl == pytest.approx(25.0)
     assert any("diverged" in r.message for r in caplog.records if r.levelname == "ERROR")
+
+
+class GatedBroker(Broker):
+    """Holds an exit order open so two closers can be made to interleave."""
+
+    name = "gated"
+
+    def __init__(self) -> None:
+        self.placed: list[OrderIntent] = []
+        self.gate = __import__("asyncio").Event()
+
+    async def place(self, intent: OrderIntent) -> OrderAck:
+        self.placed.append(intent)
+        await self.gate.wait()
+        return OrderAck(
+            ok=True,
+            order_id=f"O{len(self.placed)}",
+            status="FILLED",
+            broker=self.name,
+            avg_price=intent.price,
+            filled_quantity=intent.quantity,
+        )
+
+
+async def test_concurrent_closers_send_exactly_one_exit():
+    """Regression: a tick and a shutdown flatten both reaching the same position
+    used to send two exits, which does not leave you flat - it leaves you the
+    same size the other way round."""
+    import asyncio
+
+    risk_cfg = RiskConfig(stop_loss_pct=0.01, take_profit_pct=0.02)
+    exec_cfg = ExecutionConfig(exit_retry_backoff_s=0.0, fill_confirm_timeout_s=0.0)
+    risk = RiskEngine(risk_cfg, min_confidence=0.65)
+    broker = GatedBroker()
+    manager = PositionManager(
+        broker,
+        risk,
+        FakePrices(98.0),
+        exec_cfg,
+        risk_cfg,
+        calendar=TradingCalendar("09:20", "15:10"),
+    )
+    open_position(manager, risk)
+
+    ticking = asyncio.create_task(manager.tick(NOW))
+    await asyncio.sleep(0)
+    flattening = asyncio.create_task(manager.flatten_all("SHUTDOWN"))
+    await asyncio.sleep(0)
+
+    broker.gate.set()
+    await asyncio.gather(ticking, flattening)
+
+    assert len(broker.placed) == 1, f"sent {len(broker.placed)} exits for one position"
+    assert manager.open_positions == {}
+    assert risk.positions == {}
+
+
+async def test_closing_an_unmanaged_position_is_a_no_op():
+    """Defence in depth: a stale reference must not resurrect an exit."""
+    manager, broker, risk = build(price=98.0)
+    position = open_position(manager, risk)
+    await manager.tick(NOW)
+    assert len(broker.placed) == 1
+
+    position.closing = False  # pretend a stale caller still holds it
+    await manager._close(position, 98.0, "STALE")
+    assert len(broker.placed) == 1
