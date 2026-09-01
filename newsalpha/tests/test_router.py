@@ -198,3 +198,111 @@ async def test_entry_then_managed_exit_books_the_pnl():
     assert risk.positions == {}
     assert broker.placed[-1].side is Side.SELL
     assert positions.closed[-1]["reason"] == "SHUTDOWN"
+
+
+class SlowBroker(Broker):
+    """Takes a measurable amount of time to fill, so concurrent callers overlap."""
+
+    name = "slow"
+
+    def __init__(self) -> None:
+        self.placed: list[OrderIntent] = []
+
+    async def place(self, intent: OrderIntent) -> OrderAck:
+        import asyncio
+
+        self.placed.append(intent)
+        await asyncio.sleep(0.01)
+        return OrderAck(
+            ok=True,
+            order_id=f"O{len(self.placed)}",
+            status="FILLED",
+            broker=self.name,
+            avg_price=intent.price,
+            filled_quantity=intent.quantity,
+        )
+
+
+def burst_setup(max_open_positions=5, symbols=30):
+    rows = [
+        "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,UNDERLYING_SYMBOL,"
+        "DISPLAY_NAME,LOT_SIZE,TICK_SIZE,ISIN,SERIES"
+    ]
+    for i in range(symbols):
+        rows.append(f"NSE,E,{1000 + i},EQUITY,SYM{i},Co {i},1,0.05,INE{i:03d}A01011,EQ")
+    master = InstrumentMaster()
+    master.load_from_text("\n".join(rows))
+
+    risk_cfg = RiskConfig(
+        max_open_positions=max_open_positions,
+        max_orders_per_minute=1000,
+        stop_loss_pct=0.01,
+        take_profit_pct=0.02,
+    )
+    exec_cfg = ExecutionConfig(fill_confirm_timeout_s=0.0, exit_retry_backoff_s=0.0)
+    risk = RiskEngine(risk_cfg, min_confidence=0.65, calendar=TradingCalendar("09:20", "15:10"))
+    broker = SlowBroker()
+    router = OrderRouter(broker, risk, exec_cfg, risk_cfg, instruments=master)
+    return router, broker, risk
+
+
+async def test_position_cap_holds_under_a_simultaneous_burst():
+    """Regression: filings are handled concurrently, so every risk check between
+    an approval and its fill was a time-of-check/time-of-use race. A results-day
+    burst used to open twice the cap - defeating the control at exactly the
+    moment it exists for."""
+    import asyncio
+
+    router, broker, risk = burst_setup(max_open_positions=5, symbols=30)
+    await asyncio.gather(
+        *(router.handle(signal(f"SYM{i}"), 100.0, "", "NSE_EQ") for i in range(30))
+    )
+
+    assert len(broker.placed) == 5
+    assert len(risk.positions) == 5
+
+
+async def test_one_symbol_cannot_be_entered_twice_concurrently():
+    import asyncio
+
+    router, broker, risk = burst_setup()
+    await asyncio.gather(*(router.handle(signal("SYM0"), 100.0, "", "NSE_EQ") for _ in range(4)))
+
+    assert len(broker.placed) == 1
+    assert len(risk.positions) == 1
+
+
+async def test_a_rejected_order_gives_its_reservation_back():
+    """A leaked reservation permanently consumes a position slot - the account
+    slowly stops being able to trade, with nothing in the log to say why."""
+    router, _, risk, positions = build(confirm_ok=False)
+    await router.handle(signal(), price=100.0, security_id="", segment="NSE_EQ")
+
+    assert risk.positions == {}
+    assert risk.snapshot()["pending_orders"] == 0
+    # The slot is free again, so a later signal can still trade.
+    assert risk.evaluate(signal(), price=100.0).approved
+
+
+async def test_reservation_is_released_if_the_task_is_cancelled():
+    """Shutdown cancels in-flight handlers; their reservations must not outlive
+    them."""
+    import asyncio
+
+    router, _, risk = burst_setup()
+    task = asyncio.create_task(router.handle(signal("SYM0"), 100.0, "", "NSE_EQ"))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert risk.snapshot()["pending_orders"] == 0
+
+
+async def test_gross_notional_counts_in_flight_orders():
+    """Otherwise a burst can commit far more capital than the cap allows."""
+    router, _, risk = burst_setup()
+    decision = risk.evaluate(signal("SYM0"), price=100.0)
+
+    assert decision.approved
+    assert risk.gross_notional == pytest.approx(decision.notional)

@@ -76,48 +76,60 @@ class OrderRouter:
 
         assert price is not None  # guaranteed by the risk engine's price gate
 
-        quantity = decision.quantity
-        order_price = price
-        if instrument is not None:
-            quantity = instrument.round_quantity(quantity)
-            order_price = instrument.round_price(price)
-            if quantity <= 0:
-                reason = f"sized below one lot ({instrument.lot_size})"
-                log.info("skip %s: %s", signal.symbol, reason)
-                self._record(signal, reason, None, price)
-                return None
+        # An approved decision has reserved account capacity. Every path out of
+        # here must hand that reservation back - on_fill consumes it, everything
+        # else releases it - or the reservation leaks and the account quietly
+        # loses the ability to open positions.
+        try:
+            quantity = decision.quantity
+            order_price = price
+            if instrument is not None:
+                quantity = instrument.round_quantity(quantity)
+                order_price = instrument.round_price(price)
+                if quantity <= 0:
+                    reason = f"sized below one lot ({instrument.lot_size})"
+                    log.info("skip %s: %s", signal.symbol, reason)
+                    self._risk.release(signal.symbol)
+                    self._record(signal, reason, None, price)
+                    return None
 
-        intent = OrderIntent(
-            uid=signal.uid,
-            symbol=signal.symbol,
-            security_id=instrument.security_id if instrument else security_id,
-            exchange_segment=instrument.exchange_segment if instrument else segment,
-            side=Side.BUY if signal.direction is Direction.BULLISH else Side.SELL,
-            quantity=quantity,
-            order_type=self._exec.order_type,
-            product_type=self._exec.product_type,
-            price=order_price,
-            stop_loss_pct=self._risk_cfg.stop_loss_pct,
-            take_profit_pct=self._risk_cfg.take_profit_pct,
-            tag=signal.uid[:20],
-        )
+            intent = OrderIntent(
+                uid=signal.uid,
+                symbol=signal.symbol,
+                security_id=instrument.security_id if instrument else security_id,
+                exchange_segment=instrument.exchange_segment if instrument else segment,
+                side=Side.BUY if signal.direction is Direction.BULLISH else Side.SELL,
+                quantity=quantity,
+                order_type=self._exec.order_type,
+                product_type=self._exec.product_type,
+                price=order_price,
+                stop_loss_pct=self._risk_cfg.stop_loss_pct,
+                take_profit_pct=self._risk_cfg.take_profit_pct,
+                tag=signal.uid[:20],
+            )
 
-        self._risk.on_order_sent()
-        ack = await self._broker.place(intent)
-        if ack.ok:
-            ack = await self._broker.confirm(ack, self._exec.fill_confirm_timeout_s)
+            self._risk.on_order_sent()
+            ack = await self._broker.place(intent)
+            if ack.ok:
+                ack = await self._broker.confirm(ack, self._exec.fill_confirm_timeout_s)
 
-        if ack.ok:
-            fill_price = ack.avg_price or order_price
-            filled = ack.filled_quantity or quantity
-            self._risk.on_fill(signal, filled, fill_price)
-            if self._positions is not None:
-                self._positions.register(intent, ack)
-        else:
-            self._risk.on_reject(ack.error or ack.status)
+            if ack.ok:
+                fill_price = ack.avg_price or order_price
+                filled = ack.filled_quantity or quantity
+                self._risk.on_fill(signal, filled, fill_price)
+                if self._positions is not None:
+                    self._positions.register(intent, ack)
+            else:
+                self._risk.release(signal.symbol)
+                self._risk.on_reject(ack.error or ack.status)
 
-        self._record(signal, ack.status, ack, price, intent)
-        return ack
+            self._record(signal, ack.status, ack, price, intent)
+            return ack
+        except BaseException:
+            # Includes cancellation on shutdown. A reservation held by a task
+            # that no longer exists is never coming back on its own.
+            self._risk.release(signal.symbol)
+            raise
 
     def _resolve(self, symbol: str, security_id: str, segment: str) -> Instrument | None:
         if self._instruments is None:

@@ -55,6 +55,12 @@ class RiskEngine:
             cfg.session_start, cfg.session_end, cfg.holidays
         )
         self.positions: dict[str, Position] = {}
+        # Capacity reserved by approved-but-not-yet-filled orders. Announcements
+        # are handled concurrently, so without this every check below is a
+        # time-of-check/time-of-use race: a burst of filings all read "no
+        # position yet" before any of them fills, and the caps do nothing at
+        # precisely the moment they are needed.
+        self._pending: dict[str, float] = {}
         self.realised_pnl: float = 0.0
         self.consecutive_rejects: int = 0
         self.halted: bool = False
@@ -108,18 +114,24 @@ class RiskEngine:
         if self._orders_last_minute(now) >= self._cfg.max_orders_per_minute:
             return RiskDecision(False, "order rate limit")
 
-        if len(self.positions) >= self._cfg.max_open_positions and symbol not in self.positions:
-            return RiskDecision(False, f"max open positions ({self._cfg.max_open_positions})")
-
         if symbol in self.positions:
             # One position per name. Averaging into a news trade turns a bounded
             # loss into an unbounded one, which is exactly the wrong shape here.
             return RiskDecision(False, f"already holding {symbol}")
 
+        if symbol in self._pending:
+            return RiskDecision(False, f"order already in flight for {symbol}")
+
+        if len(self.positions) + len(self._pending) >= self._cfg.max_open_positions:
+            return RiskDecision(False, f"max open positions ({self._cfg.max_open_positions})")
+
         quantity, notional, reason = self._size(signal, price)
         if quantity <= 0:
             return RiskDecision(False, reason)
 
+        # Reserve here, with no await between the checks above and this line, so
+        # a concurrent caller cannot slip through the same gates.
+        self._pending[symbol] = notional
         return RiskDecision(True, "approved", quantity=quantity, notional=notional)
 
     # -- sizing ---------------------------------------------------------------
@@ -152,7 +164,8 @@ class RiskEngine:
 
     @property
     def gross_notional(self) -> float:
-        return sum(p.notional for p in self.positions.values())
+        """Filled exposure plus capacity reserved by in-flight orders."""
+        return sum(p.notional for p in self.positions.values()) + sum(self._pending.values())
 
     def on_order_sent(self, now: datetime | None = None) -> None:
         self._order_times.append(now or utcnow())
@@ -160,6 +173,8 @@ class RiskEngine:
     def on_fill(
         self, signal: Signal, quantity: int, price: float, now: datetime | None = None
     ) -> None:
+        """Convert a reservation into a real position."""
+        self._pending.pop(signal.symbol.upper(), None)
         side = Side.BUY if signal.direction is Direction.BULLISH else Side.SELL
         self.positions[signal.symbol.upper()] = Position(
             symbol=signal.symbol.upper(),
@@ -190,6 +205,14 @@ class RiskEngine:
         if self.realised_pnl <= -self._cfg.daily_loss_limit:
             self.halt(f"daily loss limit hit ({self.realised_pnl:.0f})")
         return pnl
+
+    def release(self, symbol: str) -> None:
+        """Give back capacity reserved by an order that never became a position.
+
+        Every path out of an approved decision must call this or on_fill, or the
+        reservation leaks and the account slowly stops being able to trade.
+        """
+        self._pending.pop(symbol.upper(), None)
 
     def on_reject(self, reason: str) -> None:
         """A broker rejection. Enough in a row means something is systemically
@@ -222,6 +245,7 @@ class RiskEngine:
             self._day = today
             self.realised_pnl = 0.0
             self.consecutive_rejects = 0
+            self._pending.clear()
             self.halted = False
             self.halt_reason = ""
 
@@ -230,6 +254,7 @@ class RiskEngine:
             "halted": self.halted,
             "halt_reason": self.halt_reason,
             "open_positions": len(self.positions),
+            "pending_orders": len(self._pending),
             "gross_notional": round(self.gross_notional, 2),
             "realised_pnl": round(self.realised_pnl, 2),
             "consecutive_rejects": self.consecutive_rejects,
