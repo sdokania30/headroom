@@ -116,7 +116,17 @@ async def merge(
     tasks = [asyncio.create_task(pump(f), name=f"feed:{f.name}") for f in feeds]
     try:
         while True:
-            yield await queue.get()
+            # Finish when every feed is exhausted and nothing is left queued.
+            # Live feeds never exhaust, so this costs them nothing - but it lets a
+            # replay feed drive the same pipeline to completion instead of hanging.
+            if queue.empty() and all(task.done() for task in tasks):
+                break
+            try:
+                # The timeout only fires while idle; an arriving item wakes this
+                # immediately, so polling adds no latency to the hot path.
+                yield await asyncio.wait_for(queue.get(), timeout=0.25)
+            except TimeoutError:
+                continue
     finally:
         for task in tasks:
             task.cancel()

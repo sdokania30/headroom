@@ -6,12 +6,17 @@ risk limits, and route it to DhanHQ — measuring latency at every stage, becaus
 latency is the entire premise.
 
 ```
-BSE / NSE filings ──► dedupe ──► regex prescreen ──► Claude ──► risk gate ──► broker
-                                       │                │          │            │
-                                       └──────── event timing engine ───────────┘
-                                                        │
-                                                    journal (JSONL)
+BSE / NSE filings ─► dedupe ─► regex prescreen ─► Claude ─► risk gate ─► broker ─┐
+                                    │               │          │                │
+                                    └────── event timing engine ────────┘        │
+                                                    │                            ▼
+                                              journal (JSONL) ◄───── position manager
+                                                                    stop │ target │
+                                                                    time │ square-off
 ```
+
+The position manager is the loop that closes trades. It runs alongside the feed,
+not after it — a quiet feed must not mean unmanaged stops.
 
 ---
 
@@ -139,14 +144,43 @@ apparent edge, which is the one error that would make you trade more.
 ### 4. Execution (`execution/`)
 
 `RiskEngine` gates every order, in paper and live alike — a paper run only means
-something if it exercises the same gates. Session window, denylist, price band,
-daily loss limit, order rate limit, position caps, gross notional headroom,
-consecutive-reject kill switch. Every rejection carries a specific reason.
+something if it exercises the same gates. Session window (weekends **and**
+holidays), square-off buffer, denylist, price band, daily loss limit, order rate
+limit, position caps, gross notional headroom, consecutive-reject kill switch.
+Every rejection carries a specific reason.
 
 Sizing is risk-parity — the stop distance sets the size, not the price — scaled by
-the model's confidence, then clamped by the per-trade cap and remaining headroom.
+the model's confidence, then clamped by the per-trade cap and remaining headroom,
+and finally rounded down to a whole lot.
 
 **No live price means no trade.** A missing quote is a rejection, never a guess.
+
+**An ack is not a fill.** `OrderRouter` confirms the order reached a terminal
+state before anyone starts managing a position; an unconfirmed order creates no
+position, because sending an exit for shares that were never bought is worse than
+missing the trade.
+
+**Symbols are resolved, not assumed.** NSE filings carry a trading symbol and no
+Dhan `securityId`. `InstrumentMaster` resolves it from Dhan's scrip master, and
+also supplies the lot size and tick size that orders are rounded to. Without it
+every NSE-sourced signal is unroutable — and the failure looks like a quiet day
+rather than a bug.
+
+`PositionManager` closes what the router opens, checking four exits in priority
+order on every tick:
+
+1. **Risk halt** — flatten immediately. A halt that leaves positions open hasn't
+   halted anything that matters.
+2. **Square-off** — an intraday position still open at the exchange's own
+   square-off gets closed by the broker at whatever price exists.
+3. **Stop / target** — the levels the trade was sized against.
+4. **Time** — `max_hold_minutes`.
+
+The first two fire even when the quote feed is down, which is exactly when you
+most want to be flat. And a **failed exit is retried and escalated, never
+dropped**: retry with backoff, then log at ERROR, journal it, and trip the risk
+halt so nothing new opens while a position is stuck. It stays registered so the
+next tick tries again.
 
 Live trading needs two independent switches (`broker: dhan` *and*
 `live_trading_armed: true`). One flag is too easy to leave set in a config you
@@ -207,24 +241,29 @@ press-correlation window, and the backtester's look-ahead guards.
 
 Honest list of what is *not* done, in rough order of how much it matters:
 
-1. **No exchange holiday calendar.** `in_session` handles weekends and hours, not
-   holidays. Wire one in before live use.
-2. **NSE symbols carry no `security_id`.** Dhan orders need one; you need an
-   instrument-master lookup to map symbol → securityId per segment.
-3. **Fills are not tracked to completion.** `DhanBroker.place` returns on the
-   broker's `PENDING` ack. Poll `status` or subscribe to the order-update socket
-   for real fills, and reconcile positions against the broker rather than trusting
-   local state.
-4. **No exit management in live mode.** The backtester models stops and targets;
-   the live path opens positions and does not manage them. Attach bracket/super
-   orders at entry, or run a position manager, before trading real size.
-5. **Attachment PDFs are not read.** Filings often put the material detail in an
+1. **The holiday list ships empty.** The calendar handles weekends and hours, and
+   holidays *are* supported — but `risk.holidays` defaults to `[]`, which means
+   every weekday is a trading day. Populate it from the NSE calendar each January
+   or the system will try to trade Diwali.
+2. **Positions are not reconciled against the broker.** Local state is the source
+   of truth between polls. A fill that happens outside this process — a manual
+   trade, a broker-side square-off, a partial fill topped up later — will not be
+   seen. Reconcile against the positions endpoint on startup and periodically
+   before trading real size.
+3. **Partial fills are treated as whole.** `confirm` reads the traded quantity,
+   but a partially-filled entry is managed as if complete and the residual order
+   is not cancelled.
+4. **Attachment PDFs are not read.** Filings often put the material detail in an
    attached PDF; only headline and body text are scored today.
-6. **The delay sweep is bounded by bar resolution** (above). Minute bars cannot
+5. **The delay sweep is bounded by bar resolution** (above). Minute bars cannot
    resolve a sub-minute edge, which is the range this strategy actually lives in.
-7. **`slippage_bps` is a constant.** In the seconds after a material filing the
+6. **`slippage_bps` is a constant.** In the seconds after a material filing the
    book is thin and moving. Paper P&L is a ceiling, not an estimate — replace this
    with your own measured fills as soon as you have any.
+7. **Exits are managed client-side, not by the exchange.** If this process dies
+   between polls, nothing is watching the stop. `flatten_on_shutdown` covers a
+   clean shutdown; it does not cover a hard kill. Exchange-side bracket orders
+   would, and are the right answer for real size.
 
 ---
 
@@ -236,10 +275,12 @@ src/newsalpha/
   config.py         layered config; secrets stay in the environment
   clock.py          per-stage stopwatch, rolling percentiles
   utils.py          IST handling, tolerant field access, JSONL journal
-  ingest/           feed loop, BSE/NSE/Dhan adapters, dedupe, replay
+  sessions.py       trading calendar: holidays, square-off, time to close
+  ingest/           feed loop, BSE/NSE/Dhan adapters, dedupe, replay,
+                    instrument master (symbol -> securityId, lot, tick)
   sentiment/        regex prescreen, Claude engine
   timing/           lag decomposition, press-pickup correlation
-  execution/        risk gates, order router, paper + Dhan brokers
+  execution/        risk gates, order router, position manager, paper + Dhan brokers
   backtest/         bar store, replay engine, delay sweep, metrics
   pipeline.py       the live wiring
   cli.py            scan / capture / paper / live / backtest / latency-report

@@ -38,11 +38,18 @@ risk:
   max_open_positions: 5
   stop_loss_pct: 0.01
   take_profit_pct: 0.02
+  max_hold_minutes: 60           # a news reaction that hasn't happened in an hour won't
   daily_loss_limit: 25000
   max_consecutive_rejects: 5
   max_orders_per_minute: 10
   session_start: "09:20"         # IST. Deliberately after the opening auction.
   session_end: "15:10"           # and before the square-off scramble.
+  square_off_buffer_s: 300       # stop opening, and start closing, before the bell
+  # Exchange holidays. EMPTY MEANS EVERY WEEKDAY TRADES - populate this before
+  # live use or the system will happily try to trade Diwali.
+  holidays: []
+  # e.g.
+  # holidays: ["2026-10-20", "2026-11-05"]
   min_price: 20
   max_price: 100000
   denylist: []
@@ -53,6 +60,12 @@ execution:
   product_type: INTRADAY
   slippage_bps: 8.0
   live_trading_armed: false      # second switch; both must be set for real orders
+  position_poll_s: 5.0           # how often stops/targets/the clock are re-checked
+  exit_retry_attempts: 3         # a rejected exit leaves real exposure - retry, then halt
+  exit_retry_backoff_s: 2.0
+  fill_confirm_timeout_s: 10.0   # an ack is not a fill; wait for a terminal state
+  flatten_on_shutdown: true      # leave this on unless something else owns exits
+  instruments_path: data/scrip_master.csv
 
 backtest:
   announcements_path: data/announcements.jsonl

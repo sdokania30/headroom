@@ -26,12 +26,13 @@ from pathlib import Path
 
 from .backtest import Backtester, BarStore, SignalCache
 from .config import Settings, load_settings
-from .execution import DhanBroker, OrderRouter, PaperBroker, RiskEngine
+from .execution import DhanBroker, OrderRouter, PaperBroker, PositionManager, RiskEngine
 from .ingest import build_client, load_announcements
 from .pipeline import (
     TradingPipeline,
     build_engine_for,
     build_feeds,
+    build_instruments,
     build_prices,
 )
 from .timing import EventTimingEngine
@@ -68,7 +69,10 @@ async def _run_pipeline(settings: Settings, mode: str) -> int:
         prices = build_prices(settings, client)
 
         router = None
+        positions = None
+        instruments = None
         if mode in ("paper", "live"):
+            instruments = await build_instruments(settings, client)
             risk = RiskEngine(settings.risk, min_confidence=settings.sentiment.min_confidence)
             if mode == "live":
                 settings.require_live_credentials()
@@ -89,14 +93,47 @@ async def _run_pipeline(settings: Settings, mode: str) -> int:
                 log.warning("LIVE TRADING ARMED - real orders will be placed")
             else:
                 broker = PaperBroker(slippage_bps=settings.execution.slippage_bps)  # type: ignore[assignment]
-            router = OrderRouter(broker, risk, settings.execution, settings.risk, journal)
 
-        pipeline = TradingPipeline(settings, feeds, engine, router, prices, timing, journal)
+            positions = PositionManager(
+                broker,
+                risk,
+                prices,
+                settings.execution,
+                settings.risk,
+                calendar=risk.calendar,
+                journal=journal,
+            )
+            router = OrderRouter(
+                broker,
+                risk,
+                settings.execution,
+                settings.risk,
+                journal,
+                positions=positions,
+                instruments=instruments,
+            )
+
+        pipeline = TradingPipeline(
+            settings, feeds, engine, router, prices, timing, journal, positions, instruments
+        )
         _install_signal_handlers(pipeline)
         await pipeline.run()
 
         log.info("processed %d announcements", pipeline.processed)
-        print(json.dumps(timing.report(), indent=2, default=str))
+        report = timing.report()
+        if positions is not None:
+            report["trades_closed"] = len(positions.closed)
+            report["realised_pnl"] = round(
+                sum(float(c.get("pnl", 0.0)) for c in positions.closed), 2
+            )
+            still_open = positions.open_positions
+            if still_open:
+                # Loud on purpose: this is the state that costs money overnight.
+                log.error(
+                    "EXITED WITH %d OPEN POSITION(S): %s", len(still_open), ", ".join(still_open)
+                )
+                report["open_positions"] = sorted(still_open)
+        print(json.dumps(report, indent=2, default=str))
         return 0
     finally:
         await client.aclose()

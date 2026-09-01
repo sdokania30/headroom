@@ -14,7 +14,9 @@ Two deliberate choices:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 
 import httpx
 
@@ -22,6 +24,24 @@ from ..models import OrderAck, OrderIntent, utcnow
 from .base import Broker
 
 log = logging.getLogger(__name__)
+
+# Dhan order lifecycle. Anything not in either set is still in flight.
+_FILLED_STATES = frozenset({"TRADED", "FILLED", "COMPLETE"})
+_DEAD_STATES = frozenset({"REJECTED", "CANCELLED", "CANCELED", "EXPIRED"})
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(float(str(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class DhanBroker(Broker):
@@ -122,6 +142,70 @@ class DhanBroker(Broker):
             status=status,
             broker=self.name,
             submitted_at=utcnow(),
+        )
+
+    async def confirm(self, ack: OrderAck, timeout_s: float = 10.0) -> OrderAck:
+        """Poll until the order reaches a terminal state or the budget runs out.
+
+        A PENDING order that never resolves is the dangerous case: the position
+        may or may not exist. Returning ok=False on timeout is deliberate - the
+        caller then treats it as un-filled and does not start managing a position
+        it might not have, and the order id is preserved in the error so the
+        stuck order is traceable in the broker's own book.
+        """
+        if not ack.ok or not ack.order_id or timeout_s <= 0:
+            return ack
+
+        deadline = time.monotonic() + timeout_s
+        delay = 0.25
+        last_status = ack.status
+        while time.monotonic() < deadline:
+            try:
+                payload = await self.status(ack.order_id)
+            except (httpx.HTTPError, ValueError) as exc:
+                log.warning("dhan: status poll failed for %s: %s", ack.order_id, exc)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 2.0)
+                continue
+
+            last_status = str(payload.get("orderStatus", last_status)).upper()
+            if last_status in _FILLED_STATES:
+                traded = _as_int(payload.get("filledQty") or payload.get("filled_qty"))
+                price = _as_float(payload.get("averageTradedPrice") or payload.get("price"))
+                log.info("dhan: order %s filled %d @ %.2f", ack.order_id, traded, price)
+                return OrderAck(
+                    ok=True,
+                    order_id=ack.order_id,
+                    status=last_status,
+                    broker=self.name,
+                    submitted_at=ack.submitted_at,
+                    avg_price=price,
+                    filled_quantity=traded,
+                )
+            if last_status in _DEAD_STATES:
+                log.warning("dhan: order %s ended %s", ack.order_id, last_status)
+                return OrderAck(
+                    ok=False,
+                    order_id=ack.order_id,
+                    status=last_status,
+                    broker=self.name,
+                    error=str(payload.get("omsErrorDescription") or last_status),
+                )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 2.0)
+
+        log.error(
+            "dhan: order %s still %s after %.1fs - treating as unconfirmed",
+            ack.order_id,
+            last_status,
+            timeout_s,
+        )
+        return OrderAck(
+            ok=False,
+            order_id=ack.order_id,
+            status="UNCONFIRMED",
+            broker=self.name,
+            error=f"order {ack.order_id} not terminal after {timeout_s:.0f}s (last: {last_status})",
         )
 
     async def status(self, order_id: str) -> dict[str, object]:

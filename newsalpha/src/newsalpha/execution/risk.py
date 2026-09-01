@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 
 from ..config import RiskConfig
 from ..models import Direction, RiskDecision, Side, Signal, utcnow
-from ..utils import in_session
+from ..sessions import TradingCalendar
 
 log = logging.getLogger(__name__)
 
@@ -43,9 +43,17 @@ class Position:
 class RiskEngine:
     """Stateful account-level guardrails."""
 
-    def __init__(self, cfg: RiskConfig, min_confidence: float = 0.0) -> None:
+    def __init__(
+        self,
+        cfg: RiskConfig,
+        min_confidence: float = 0.0,
+        calendar: TradingCalendar | None = None,
+    ) -> None:
         self._cfg = cfg
         self._min_confidence = min_confidence
+        self.calendar = calendar or TradingCalendar.from_config(
+            cfg.session_start, cfg.session_end, cfg.holidays
+        )
         self.positions: dict[str, Position] = {}
         self.realised_pnl: float = 0.0
         self.consecutive_rejects: int = 0
@@ -73,10 +81,15 @@ class RiskEngine:
                 False, f"confidence {signal.confidence:.2f} < {self._min_confidence:.2f}"
             )
 
-        if not in_session(now, self._cfg.session_start, self._cfg.session_end):
+        if not self.calendar.is_open(now):
             return RiskDecision(
                 False, f"outside session {self._cfg.session_start}-{self._cfg.session_end} IST"
             )
+
+        # Refuse entries inside the square-off buffer. The position manager is
+        # about to start closing things; opening into that is self-defeating.
+        if self.calendar.closing_soon(now, self._cfg.square_off_buffer_s):
+            return RiskDecision(False, "inside square-off buffer")
 
         symbol = signal.symbol.upper()
         if symbol in {s.upper() for s in self._cfg.denylist}:
@@ -157,13 +170,22 @@ class RiskEngine:
         )
         self.consecutive_rejects = 0
 
-    def on_close(self, symbol: str, exit_price: float) -> float:
-        """Close a position, book the P&L, and trip the kill switch if needed."""
+    def on_close(self, symbol: str, exit_price: float) -> float | None:
+        """Close a position and book the P&L.
+
+        Returns None - not 0.0 - when the symbol was not tracked here. That
+        distinction matters: a zero would silently fold a bookkeeping divergence
+        into the day's P&L, and the daily loss limit is computed from that number.
+        The caller is expected to treat None as the alarm it is.
+        """
         position = self.positions.pop(symbol.upper(), None)
         if position is None:
-            return 0.0
+            return None
         sign = 1.0 if position.side is Side.BUY else -1.0
-        pnl = sign * (exit_price - position.entry_price) * position.quantity
+        return self.book_pnl(sign * (exit_price - position.entry_price) * position.quantity)
+
+    def book_pnl(self, pnl: float) -> float:
+        """Add to the day's realised P&L, tripping the kill switch if breached."""
         self.realised_pnl += pnl
         if self.realised_pnl <= -self._cfg.daily_loss_limit:
             self.halt(f"daily loss limit hit ({self.realised_pnl:.0f})")

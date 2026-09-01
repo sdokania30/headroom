@@ -95,6 +95,9 @@ class RiskConfig(BaseModel):
 
     stop_loss_pct: float = Field(default=0.01, gt=0, le=0.2)
     take_profit_pct: float = Field(default=0.02, gt=0, le=0.5)
+    # Give up on a thesis that has not played out. A news reaction that has not
+    # happened within the hour is not going to.
+    max_hold_minutes: int = Field(default=60, ge=1)
 
     # Kill switches.
     daily_loss_limit: float = Field(default=25_000.0, gt=0)
@@ -105,6 +108,12 @@ class RiskConfig(BaseModel):
     # rejected: an announcement at 15:29 is not an intraday opportunity.
     session_start: str = "09:20"
     session_end: str = "15:10"
+    # Exchange holidays, YYYY-MM-DD. Empty means every weekday trades, which is
+    # wrong roughly fifteen days a year - populate before live use.
+    holidays: list[str] = Field(default_factory=list)
+    # Stop opening new positions this many seconds before the close, and square
+    # off anything still open. An entry with 90 seconds left is not a trade.
+    square_off_buffer_s: float = Field(default=300.0, ge=0)
 
     min_price: float = Field(default=20.0, ge=0)
     max_price: float = Field(default=100_000.0, gt=0)
@@ -127,6 +136,22 @@ class ExecutionConfig(BaseModel):
     slippage_bps: float = Field(default=8.0, ge=0)
     dhan_base_url: str = "https://api.dhan.co"
     http_timeout_s: float = Field(default=3.0, gt=0)
+    # How often the position manager re-checks stops, targets and the clock.
+    position_poll_s: float = Field(default=5.0, gt=0)
+    # A rejected exit leaves real exposure, so it is retried before escalating.
+    exit_retry_attempts: int = Field(default=3, ge=1)
+    exit_retry_backoff_s: float = Field(default=2.0, ge=0)
+    # Poll the broker this long for a terminal order state before treating a
+    # fill as unconfirmed. Zero disables confirmation (the paper broker fills
+    # inline and needs none).
+    fill_confirm_timeout_s: float = Field(default=10.0, ge=0)
+    # Close open positions when the process shuts down. On by default: an
+    # intraday position left open by a dead process is unmanaged exposure, and
+    # nothing will be watching its stop. Turn off only if something else owns
+    # the exit path.
+    flatten_on_shutdown: bool = True
+    # Cached Dhan scrip master, for symbol -> securityId resolution.
+    instruments_path: str = "data/scrip_master.csv"
     # Live trading requires this to be explicitly flipped *and* broker="dhan".
     # Two independent switches, because one is too easy to leave on.
     live_trading_armed: bool = False
