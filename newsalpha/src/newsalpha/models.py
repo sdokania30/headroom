@@ -44,6 +44,68 @@ class Horizon(str, Enum):
     SWING = "SWING"
 
 
+class Rating(str, Enum):
+    """What the dashboard shows.
+
+    Deliberately five buckets, not a score. A number like 0.73 invites false
+    precision and quiet over-trading; five labels force the model's view into
+    something you can act on or ignore at a glance.
+    """
+
+    STRONG_BUY = "STRONG BUY"
+    BUY = "BUY"
+    HOLD = "HOLD"
+    SELL = "SELL"
+    STRONG_SELL = "STRONG SELL"
+
+    @property
+    def is_actionable(self) -> bool:
+        return self is not Rating.HOLD
+
+    @property
+    def side(self) -> str:
+        if self in (Rating.STRONG_BUY, Rating.BUY):
+            return "LONG"
+        if self in (Rating.STRONG_SELL, Rating.SELL):
+            return "SHORT"
+        return "FLAT"
+
+
+# Conviction thresholds. Conviction combines how sure the model is with how big
+# the event is - a certain read on a trivial filing is not a trade, and nor is a
+# coin-flip on a huge one.
+STRONG_CONVICTION = 0.55
+ACTIONABLE_CONVICTION = 0.30
+# Hard floor on confidence, applied before conviction. Conviction alone conflates
+# "unsure" with "small": a 0.30 confidence on a company-defining filing scores the
+# same as a certain read on a minor one, but 0.30 means the model believes the
+# call is more likely wrong than right. That is never a trade, at any size.
+MIN_CONFIDENCE = 0.55
+
+
+def conviction_of(confidence: float, materiality: int) -> float:
+    """Confidence weighted by materiality, 0.0-1.0."""
+    return max(0.0, min(1.0, confidence)) * max(0, min(5, materiality)) / 5.0
+
+
+def rate(direction: Direction, confidence: float, materiality: int) -> Rating:
+    """Map a scored filing onto the five-bucket scale."""
+    if direction is Direction.NEUTRAL:
+        return Rating.HOLD
+
+    if confidence < MIN_CONFIDENCE:
+        return Rating.HOLD
+
+    conviction = conviction_of(confidence, materiality)
+    if conviction < ACTIONABLE_CONVICTION:
+        return Rating.HOLD
+
+    strong = conviction >= STRONG_CONVICTION
+    if direction is Direction.BULLISH:
+        return Rating.STRONG_BUY if strong else Rating.BUY
+    return Rating.STRONG_SELL if strong else Rating.SELL
+
+
 @dataclass(frozen=True, slots=True)
 class Announcement:
     """One corporate filing / exchange announcement, normalised across sources.
@@ -120,6 +182,9 @@ class Signal:
     rationale: str
     engine: str
     key_numbers: tuple[str, ...] = ()
+    # Swing-relevant context. Empty when the engine could not judge it.
+    horizon_days: int = 0
+    key_risk: str = ""
     latency_ms: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -127,6 +192,14 @@ class Signal:
     @property
     def is_actionable(self) -> bool:
         return self.direction is not Direction.NEUTRAL
+
+    @property
+    def conviction(self) -> float:
+        return conviction_of(self.confidence, self.materiality)
+
+    @property
+    def rating(self) -> Rating:
+        return rate(self.direction, self.confidence, self.materiality)
 
 
 @dataclass(frozen=True, slots=True)

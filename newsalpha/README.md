@@ -1,22 +1,27 @@
 # newsalpha
 
-Event-driven trading on Indian corporate filings: pull exchange announcements the
-moment they publish, have Claude judge what they mean, size the trade against hard
-risk limits, and route it to DhanHQ — measuring latency at every stage, because
-latency is the entire premise.
+A swing-trading research screen for Indian corporate filings: pull BSE and NSE
+announcements as they publish, have Claude judge what each one means for the stock
+over the next few weeks, and rate it **Strong Buy / Buy / Hold / Sell / Strong
+Sell** on a dashboard you check each morning.
+
+It does not place orders. Execution code exists and is fully tested, but it is off
+by default and behind two switches — the product here is the shortlist, not a bot.
 
 ```
-BSE / NSE filings ─► dedupe ─► regex prescreen ─► Claude ─► risk gate ─► broker ─┐
-                                    │               │          │                │
-                                    └────── event timing engine ────────┘        │
-                                                    │                            ▼
-                                              journal (JSONL) ◄───── position manager
-                                                                    stop │ target │
-                                                                    time │ square-off
+BSE / NSE filings ─► dedupe ─► regex prescreen ─► Claude ─► rating ─► DASHBOARD
+                                    │               │                    ▲
+                                    └── event timing engine ──┘          │
+                                                    │                    │
+                                              journal (JSONL) ────────────
 ```
 
-The position manager is the loop that closes trades. It runs alongside the feed,
-not after it — a quiet feed must not mean unmanaged stops.
+**Rating** is the model's direction weighted by how material the filing is. A
+certain read on a trivial filing is not a trade, and nor is a coin-flip on a huge
+one — both come out HOLD.
+
+Optional and off by default: a risk engine, order router and position manager that
+can turn ratings into DhanHQ orders. See *Execution (optional)* below.
 
 ---
 
@@ -30,13 +35,18 @@ actually good at: pricing and execution. If your Dhan plan does expose a filings
 endpoint, point `feeds.dhan_ann_path` at it and flip `feeds.dhan: true` — the
 adapter is there and normalises into the same shape.
 
-**On the edge being traded.** Exchange filings are public disclosures, and reading
-them faster than a newswire does is a legitimate infrastructure edge — this is not
-trading on non-public information. But the edge is an empirical claim, not a given.
-The `latency-report` command and the backtester's delay sweep exist specifically to
-test it. Run those before you commit money: if P&L barely changes between a 1-second
-and a 30-second delay, the strategy is not a latency strategy and the engineering
-spend belongs elsewhere.
+**Latency mostly does not matter for swing trading.** Being four minutes ahead of
+the newswire is irrelevant if you hold for a week. That is good news: polling is
+fine, you need no low-latency infrastructure, and you can afford to spend time on a
+better read of each filing. What binds instead is **signal quality** — judging
+correctly, and not missing filings.
+
+The latency machinery is still here (`latency-report`, and the backtester's delay
+sweep) because it answers a question worth asking once: how much of any edge is
+timing versus judgment. Run it if you are curious; it is no longer the premise.
+
+Exchange filings are public disclosures — reading and rating them is ordinary
+research, not trading on non-public information.
 
 **Defaults are deliberately timid.** Paper broker, live trading disarmed, small
 size, and a rules-based prescreen that discards ~90% of the feed before it costs
@@ -59,11 +69,12 @@ Requires Python 3.10+.
 ## Use
 
 ```bash
-# 0. Check readiness. Run this before anything that can trade.
-newsalpha -c config.yaml preflight --live
+# See the dashboard format immediately, with example filings.
+newsalpha dashboard --sample -o signals.html
 
-# 1. Score live filings, place nothing. Only needs ANTHROPIC_API_KEY.
-newsalpha -c config.yaml scan
+# The daily loop: score today's filings, then render them.
+newsalpha -c config.yaml scan            # needs only ANTHROPIC_API_KEY
+newsalpha -c config.yaml dashboard -o signals.html
 
 # 2. Record filings for a few sessions so you have something to backtest.
 newsalpha -c config.yaml capture -o data/announcements.jsonl
@@ -81,8 +92,9 @@ newsalpha -c config.yaml live
 newsalpha latency-report -j journal/timing.jsonl
 ```
 
-Start at `scan`. Do not skip step 2 — a strategy validated on somebody else's
-captured data is not validated.
+Start with `dashboard --sample` to see the format, then `scan` for real filings.
+Do not skip `capture` before backtesting — a strategy validated on somebody else's
+data is not validated.
 
 `preflight` checks the things that otherwise fail silently: a missing instrument
 master (no NSE signal is routable, and it looks like a quiet day), an empty
@@ -151,7 +163,9 @@ that caused it — same symbol, later timestamp, strong headline overlap after
 stripping boilerplate. Deliberately conservative: a false match inflates the
 apparent edge, which is the one error that would make you trade more.
 
-### 4. Execution (`execution/`)
+### 4. Execution (`execution/`) — optional, off by default
+
+This layer only runs if you ask for it: `scan` and `dashboard` never touch it, `paper` uses a simulated broker, and `live` needs two independent switches plus a passing pre-flight. Keep it off and the dashboard is the whole product.
 
 `RiskEngine` gates every order, in paper and live alike — a paper run only means
 something if it exercises the same gates. Session window (weekends **and**

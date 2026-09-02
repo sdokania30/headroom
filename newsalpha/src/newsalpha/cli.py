@@ -26,6 +26,7 @@ from pathlib import Path
 
 from .backtest import Backtester, BarStore, SignalCache
 from .config import Settings, load_settings
+from .dashboard import collect, row_from_record, summarise, write
 from .execution import DhanBroker, OrderRouter, PaperBroker, PositionManager, RiskEngine
 from .ingest import build_client, load_announcements
 from .pipeline import (
@@ -276,6 +277,41 @@ def _latency_report(journal_path: str) -> int:
     return 0
 
 
+def _dashboard(settings: Settings, sources: list[str], out: str, sample: bool) -> int:
+    """Render rated filings as a browsable page."""
+    if sample:
+        from .sample import SAMPLE_SIGNALS
+
+        rows = [r for rec in SAMPLE_SIGNALS if (r := row_from_record(rec))]
+        rows.sort(key=lambda r: -r.conviction)
+    else:
+        paths = sources or [
+            str(Path(settings.journal_dir) / name) for name in ("scan.jsonl", "paper.jsonl")
+        ]
+        rows = collect(*paths)
+
+    if not rows:
+        log.error(
+            "no rated filings found. Run `newsalpha scan` first, or use --sample to see the format."
+        )
+        return 1
+
+    path = write(rows, out, sample=sample)
+    counts = summarise(rows)
+    log.info(
+        "%d filings -> %s  (%d strong buy, %d buy, %d sell, %d strong sell, %d hold)",
+        len(rows),
+        path,
+        counts["STRONG BUY"],
+        counts["BUY"],
+        counts["SELL"],
+        counts["STRONG SELL"],
+        counts["HOLD"],
+    )
+    print(path)
+    return 0
+
+
 async def _preflight(settings: Settings, live: bool) -> int:
     client = build_client()
     try:
@@ -292,6 +328,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-c", "--config", help="path to config.yaml")
     parser.add_argument("--log-level", default="")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    dashboard = sub.add_parser("dashboard", help="render rated filings as an HTML page")
+    dashboard.add_argument("-i", "--input", action="append", default=[], help="journal JSONL")
+    dashboard.add_argument("-o", "--out", default="dashboard.html")
+    dashboard.add_argument("--sample", action="store_true", help="render example filings")
 
     preflight = sub.add_parser("preflight", help="check readiness before trading")
     preflight.add_argument(
@@ -324,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
         return _latency_report(args.journal)
 
     try:
+        if args.command == "dashboard":
+            return _dashboard(settings, args.input, args.out, args.sample)
         if args.command == "preflight":
             return asyncio.run(_preflight(settings, args.live))
         if args.command == "capture":

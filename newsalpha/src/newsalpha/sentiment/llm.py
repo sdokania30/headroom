@@ -36,14 +36,17 @@ log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
 You are a sell-side event analyst covering Indian listed equities (NSE/BSE). You \
-read a single corporate filing and judge its likely effect on that company's own \
-share price over the next few hours of trading.
+read a single corporate filing and judge what it means for that company's share \
+price over the next one to four weeks - a swing horizon, not a day trade.
 
 Judge the filing on its economic substance, not its tone. Specifically:
 
 - Size matters more than language. An order win worth 0.5% of annual revenue is \
 not material; one worth 15% is. If the filing gives no numbers and no way to \
 gauge scale, materiality is low by definition.
+- You are judging a multi-week move, so ask whether this changes the earnings or \
+balance-sheet picture - not whether it produces a pop. A one-day reaction that \
+fully reverses is NEUTRAL for this purpose.
 - Routine compliance filings - newspaper publications, trading-window closures, \
 certificates under a regulation, schedule intimations, shareholding patterns - \
 are NEUTRAL with materiality 0, however dramatic the wording.
@@ -53,18 +56,23 @@ weaker than a decision taken. Say so in the confidence.
 which you usually cannot see. Absent that, be conservative.
 - Anything touching auditor resignation, going-concern doubt, debt default, \
 insolvency proceedings, regulatory penalty or fraud is high-materiality BEARISH \
-even when the filing is worded reassuringly.
+even when the filing is worded reassuringly. These tend to keep working against \
+the price for weeks, which is exactly the horizon in question.
+- Prefer NEUTRAL when genuinely unsure. A wrong high-conviction call costs far \
+more than a missed one, and the reader can only act on a handful of names.
 
 Direction is the expected move in the filing company's stock: BULLISH (up), \
-BEARISH (down), NEUTRAL (no tradable edge).
+BEARISH (down), NEUTRAL (no tradable view).
 Confidence is your probability that the direction is right, 0.0-1.0. Use the full \
 range; 0.5 means a coin flip and should be reported as such rather than rounded up.
 Materiality is 0-5: 0 routine, 1 negligible, 2 minor, 3 notable, 4 significant, \
 5 company-defining.
-Horizon is INTRADAY if the move should be priced in within the session, SWING if \
-it takes days.
-Keep the rationale under 30 words. Put any figures that drove the call in \
-key_numbers (e.g. "order value INR 1,240 cr", "12% of FY24 revenue").
+horizon_days is roughly how long you expect the move to take to play out, 1-60.
+Keep the rationale under 30 words, and write it so a person deciding whether to \
+open a position learns something from it.
+key_risk is the single most likely reason this call is wrong - one short phrase.
+Put any figures that drove the call in key_numbers (e.g. "order value INR 1,240 \
+cr", "12% of FY24 revenue").
 
 Return only the structured object. Do not hedge in prose - the numbers carry it."""
 
@@ -75,7 +83,9 @@ RESPONSE_SCHEMA: dict[str, Any] = {
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "materiality": {"type": "integer", "minimum": 0, "maximum": 5},
         "horizon": {"type": "string", "enum": ["INTRADAY", "SWING"]},
+        "horizon_days": {"type": "integer", "minimum": 1, "maximum": 60},
         "rationale": {"type": "string"},
+        "key_risk": {"type": "string"},
         "key_numbers": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
@@ -83,7 +93,9 @@ RESPONSE_SCHEMA: dict[str, Any] = {
         "confidence",
         "materiality",
         "horizon",
+        "horizon_days",
         "rationale",
+        "key_risk",
         "key_numbers",
     ],
     "additionalProperties": False,
@@ -226,13 +238,15 @@ class LLMSentimentEngine:
             confidence=_as_float(payload.get("confidence"), 0.0, 1.0),
             materiality=int(_as_float(payload.get("materiality"), 0, 5)),
             horizon=(
-                Horizon.SWING
-                if str(payload.get("horizon", "")).upper() == "SWING"
-                else Horizon.INTRADAY
+                Horizon.INTRADAY
+                if str(payload.get("horizon", "")).upper() == "INTRADAY"
+                else Horizon.SWING
             ),
             rationale=str(payload.get("rationale", ""))[:300],
             engine=f"llm:{self._cfg.model}",
             key_numbers=tuple(str(n) for n in key_numbers[:6]),
+            horizon_days=int(_as_float(payload.get("horizon_days"), 0, 60)),
+            key_risk=str(payload.get("key_risk", ""))[:200],
             latency_ms=round(latency_ms, 2),
             input_tokens=getattr(usage, "input_tokens", 0) or 0,
             output_tokens=getattr(usage, "output_tokens", 0) or 0,
