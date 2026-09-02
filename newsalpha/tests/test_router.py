@@ -92,14 +92,6 @@ def build(confirm_ok=True, with_instruments=True):
     return router, broker, risk, positions
 
 
-@pytest.fixture(autouse=True)
-def _inside_session(monkeypatch):
-    """Pin 'now' inside the trading window so routing is not time-dependent."""
-    import newsalpha.execution.risk as risk_module
-
-    monkeypatch.setattr(risk_module, "utcnow", lambda: NOW)
-
-
 async def test_resolves_the_security_id_from_the_symbol():
     """NSE filings carry no securityId. Without resolution nothing is routable."""
     router, broker, _, _ = build()

@@ -345,7 +345,10 @@ class PositionManager:
         # Out of attempts with real exposure still on. Halt so nothing new opens,
         # shout, and leave the position registered so the next tick tries again.
         position.closing = False
-        self._risk.halt(f"could not exit {position.symbol} after {position.exit_attempts} attempts")
+        self._risk.halt(
+            f"could not exit {position.symbol} after {position.exit_attempts} attempts",
+            sticky=True,
+        )
         log.error(
             "STUCK POSITION: %s %s x%d - exit rejected %d times. Manual intervention needed.",
             position.side.value,

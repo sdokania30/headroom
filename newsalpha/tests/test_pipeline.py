@@ -8,8 +8,6 @@ that processes filings all day and places nothing.
 import json
 from datetime import datetime, timedelta
 
-import pytest
-
 from newsalpha.config import Settings
 from newsalpha.execution import OrderRouter, PaperBroker, PositionManager, RiskEngine
 from newsalpha.ingest.instruments import InstrumentMaster
@@ -57,13 +55,6 @@ class FixedPrices:
 
     async def ltp(self, segment, security_id):
         return self.price
-
-
-@pytest.fixture(autouse=True)
-def _inside_session(monkeypatch):
-    import newsalpha.execution.risk as risk_module
-
-    monkeypatch.setattr(risk_module, "utcnow", lambda: NOW)
 
 
 def build(tmp_path, price=100.0):

@@ -155,3 +155,72 @@ def test_new_day_resets_pnl_and_halt(engine):
 def test_incoherent_config_is_rejected_at_load():
     with pytest.raises(ValueError):
         RiskConfig(stop_loss_pct=0.05, take_profit_pct=0.02)
+
+
+# --- trading-day roll -------------------------------------------------------
+
+
+def test_the_day_does_not_roll_backwards(engine):
+    """A timestamp moving backwards - a replay, a clock correction, a caller
+    passing a fixed date - must not wipe the day's losses. This bug cleared a
+    live halt and approved the next order."""
+    engine.realised_pnl = -30_000
+    engine.halt("daily loss limit hit")
+
+    yesterday = IN_SESSION - timedelta(days=1)
+    decision = engine.evaluate(make_signal(), price=1500.0, now=yesterday)
+
+    assert engine.halted
+    assert engine.realised_pnl == -30_000
+    assert not decision.approved
+
+
+def test_the_day_boundary_is_ist_not_utc(engine):
+    """01:00 IST is still the previous UTC date. Comparing the two makes the
+    reset fire spuriously on every call between midnight and 05:30 IST."""
+    engine.realised_pnl = -5_000
+    small_hours = datetime(2026, 9, 1, 1, 0, tzinfo=IST)
+    engine.evaluate(make_signal(), price=1500.0, now=small_hours)
+    assert engine.realised_pnl == -5_000
+
+
+def test_a_daily_loss_halt_clears_on_the_next_day(engine):
+    engine.realised_pnl = -30_000
+    engine.halt("daily loss limit hit")
+
+    tomorrow = IN_SESSION + timedelta(days=1)
+    decision = engine.evaluate(make_signal(), price=1500.0, now=tomorrow)
+
+    assert not engine.halted
+    assert engine.realised_pnl == 0.0
+    assert decision.approved
+
+
+def test_a_sticky_halt_survives_the_new_day(engine):
+    """A stuck position is not a property of the day. Resuming into one tomorrow
+    morning because the clock rolled over would be exactly wrong."""
+    engine.halt("could not exit INFY after 3 attempts", sticky=True)
+
+    tomorrow = IN_SESSION + timedelta(days=1)
+    decision = engine.evaluate(make_signal(), price=1500.0, now=tomorrow)
+
+    assert engine.halted
+    assert not decision.approved
+    assert engine.realised_pnl == 0.0, "P&L still resets; only the halt persists"
+
+
+def test_broker_reject_halts_are_sticky(engine):
+    for _ in range(engine._cfg.max_consecutive_rejects):
+        engine.on_reject("bad securityId")
+
+    tomorrow = IN_SESSION + timedelta(days=1)
+    engine.evaluate(make_signal(), price=1500.0, now=tomorrow)
+    assert engine.halted, "a systemic broker failure must not clear overnight"
+
+
+def test_resume_clears_even_a_sticky_halt(engine):
+    engine.halt("could not exit INFY", sticky=True)
+    engine.resume()
+
+    assert not engine.halted
+    assert engine.evaluate(make_signal(), price=1500.0, now=IN_SESSION).approved

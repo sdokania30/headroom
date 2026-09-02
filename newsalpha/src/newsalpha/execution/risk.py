@@ -18,11 +18,12 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from ..config import RiskConfig
 from ..models import Direction, RiskDecision, Side, Signal, utcnow
 from ..sessions import TradingCalendar
+from ..utils import IST
 
 log = logging.getLogger(__name__)
 
@@ -70,8 +71,10 @@ class RiskEngine:
         self.consecutive_rejects: int = 0
         self.halted: bool = False
         self.halt_reason: str = ""
+        # A sticky halt needs a human; a new trading day will not clear it.
+        self._halt_sticky: bool = False
         self._order_times: deque[datetime] = deque(maxlen=cfg.max_orders_per_minute * 4)
-        self._day: str = utcnow().date().isoformat()
+        self._day: date = utcnow().astimezone(IST).date()
 
     # -- main gate ------------------------------------------------------------
 
@@ -246,18 +249,31 @@ class RiskEngine:
         more orders into it will not help."""
         self.consecutive_rejects += 1
         if self.consecutive_rejects >= self._cfg.max_consecutive_rejects:
-            self.halt(f"{self.consecutive_rejects} consecutive broker rejects ({reason})")
+            self.halt(
+                f"{self.consecutive_rejects} consecutive broker rejects ({reason})",
+                sticky=True,
+            )
 
-    def halt(self, reason: str) -> None:
+    def halt(self, reason: str, sticky: bool = False) -> None:
+        """Stop trading.
+
+        ``sticky`` marks a halt that a new day must not clear. A daily loss limit
+        is a property of the day and expires with it; a stuck position or a run
+        of broker rejections is a property of the *system*, and resuming into it
+        tomorrow morning because the clock rolled over would be the wrong call
+        entirely. Those need a person to look and call resume().
+        """
         if not self.halted:
-            log.error("RISK HALT: %s", reason)
+            log.error("RISK HALT%s: %s", " (sticky)" if sticky else "", reason)
         self.halted = True
         self.halt_reason = reason
+        self._halt_sticky = self._halt_sticky or sticky
 
     def resume(self) -> None:
         """Manual only. Nothing in this system un-halts itself."""
         self.halted = False
         self.halt_reason = ""
+        self._halt_sticky = False
         self.consecutive_rejects = 0
 
     def _orders_last_minute(self, now: datetime) -> int:
@@ -265,14 +281,37 @@ class RiskEngine:
         return sum(1 for t in self._order_times if t > cutoff)
 
     def _roll_day(self, now: datetime) -> None:
-        today = now.date().isoformat()
-        if today != self._day:
-            log.info("new session %s: resetting daily P&L and halt state", today)
-            self._day = today
-            self.realised_pnl = 0.0
-            self.unrealised_pnl = 0.0
-            self.consecutive_rejects = 0
-            self._pending.clear()
+        """Reset per-day state when a new trading day starts.
+
+        Three things this gets right that the obvious version does not:
+
+        * The day is an **IST** date. The trading day is an IST concept, and
+          comparing it against a UTC date makes the two disagree between midnight
+          and 05:30 IST - so the reset would fire spuriously every call.
+        * It only rolls **forwards**. A timestamp that moves backwards - a replay,
+          a clock correction, a caller passing a fixed date - must not reset the
+          day's losses.
+        * It does not clear a sticky halt. A daily loss limit expires with the
+          day; a stuck position or a run of broker rejects does not, and resuming
+          into one tomorrow because the clock rolled over would be wrong.
+        """
+        today = now.astimezone(IST).date()
+        if today <= self._day:
+            return
+
+        log.info("new session %s: resetting daily P&L", today.isoformat())
+        self._day = today
+        self.realised_pnl = 0.0
+        self.unrealised_pnl = 0.0
+        self.consecutive_rejects = 0
+        self._pending.clear()
+        if self._halt_sticky:
+            log.warning(
+                "new session but the halt is sticky and stands: %s. "
+                "Investigate and call resume() deliberately.",
+                self.halt_reason,
+            )
+        else:
             self.halted = False
             self.halt_reason = ""
 
@@ -280,6 +319,7 @@ class RiskEngine:
         return {
             "halted": self.halted,
             "halt_reason": self.halt_reason,
+            "halt_sticky": self._halt_sticky,
             "open_positions": len(self.positions),
             "pending_orders": len(self._pending),
             "gross_notional": round(self.gross_notional, 2),
