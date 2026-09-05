@@ -20,6 +20,8 @@ from strategy import (
     ema,
     evaluate_rvol_gate,
     find_chandelier_exit,
+    find_orb_entry,
+    opening_range,
     scan_4h,
 )
 
@@ -270,37 +272,160 @@ class ChandelierTests(unittest.TestCase):
         self.assertEqual(find_chandelier_exit(candles, Direction.LONG, entry_index=61).index, 61)
 
 
+class OrbEntryTests(unittest.TestCase):
+    """5-minute opening range, 15-minute entry window, 9% RVOL. Tick 0.05."""
+
+    OPEN = datetime(2026, 1, 5, 9, 15)
+    ADV = 100_000.0
+    TICK = 0.05
+
+    def m5(self, specs: list[tuple[float, float]]) -> list[Candle]:
+        """(high, volume) per 5-minute bar, starting at the session open."""
+        return [
+            Candle(
+                ts=self.OPEN + timedelta(minutes=5 * i),
+                open=100.0,
+                high=h,
+                low=99.0,
+                close=100.0,
+                volume=v,
+            )
+            for i, (h, v) in enumerate(specs)
+        ]
+
+    def entry(self, specs, **kw):
+        return find_orb_entry(self.m5(specs), self.OPEN, self.ADV, self.TICK, **kw)
+
+    def test_opening_range_is_the_first_five_minutes_only(self):
+        rng = opening_range(self.m5([(101.0, 0), (108.0, 0), (109.0, 0)]), self.OPEN, 5)
+        self.assertEqual(rng.bars, 1)
+        self.assertAlmostEqual(rng.high, 101.0)
+        self.assertTrue(rng.complete)
+
+    def test_opening_range_spans_the_bars_inside_its_window(self):
+        rng = opening_range(self.m5([(101.0, 0), (108.0, 0), (109.0, 0)]), self.OPEN, 10)
+        self.assertEqual(rng.bars, 2)
+        self.assertAlmostEqual(rng.high, 108.0)
+
+    def test_entry_level_is_one_tick_above_the_or_high(self):
+        e = self.entry([(101.0, 9000.0), (100.5, 100.0)])
+        self.assertAlmostEqual(e.level, 101.05)
+
+    def test_fills_on_the_second_bar_when_rvol_latches_on_the_first(self):
+        e = self.entry([(101.0, 9000.0), (105.0, 500.0), (106.0, 100.0)])
+        self.assertTrue(e.filled)
+        self.assertEqual(e.reason, "filled")
+        self.assertEqual(e.fill_ts, self.OPEN + timedelta(minutes=5))
+
+    def test_a_late_rvol_latch_still_fills_inside_the_fifteen_minute_window(self):
+        # 4% on bar 1, 9% cumulative only at bar 2's close -> bar 3 is the fill.
+        e = self.entry([(101.0, 4000.0), (105.0, 5000.0), (106.0, 100.0)])
+        self.assertTrue(e.filled)
+        self.assertEqual(e.fill_ts, self.OPEN + timedelta(minutes=10))
+
+    def test_the_same_late_latch_misses_a_ten_minute_window(self):
+        e = self.entry(
+            [(101.0, 4000.0), (105.0, 5000.0), (106.0, 100.0)],
+            entry_window_minutes=10,
+            rvol_window_minutes=10,
+        )
+        self.assertFalse(e.filled)
+        self.assertTrue(e.rvol.passed)
+        self.assertEqual(e.reason, "no_breakout")
+
+    def test_no_fill_when_the_rvol_gate_never_passes(self):
+        e = self.entry([(101.0, 100.0), (105.0, 100.0), (106.0, 100.0)])
+        self.assertFalse(e.filled)
+        self.assertEqual(e.reason, "no_rvol")
+
+    def test_no_fill_when_price_never_takes_out_the_or_high(self):
+        e = self.entry([(101.0, 9000.0), (100.9, 100.0), (101.04, 100.0)])
+        self.assertFalse(e.filled)
+        self.assertEqual(e.reason, "no_breakout")
+
+    def test_bars_after_the_window_cannot_fill(self):
+        e = self.entry([(101.0, 9000.0), (100.5, 100.0), (100.5, 100.0), (200.0, 100.0)])
+        self.assertFalse(e.filled)
+
+    def test_an_order_cannot_fill_on_the_bar_that_placed_it(self):
+        # RVOL latches only at bar 1's close, so bar 1 itself is not fillable.
+        e = self.entry([(105.0, 9000.0), (100.5, 100.0)])
+        self.assertFalse(e.filled)
+
+    def test_window_not_longer_than_the_opening_range_is_rejected(self):
+        e = self.entry([(101.0, 9000.0)], or_minutes=5, entry_window_minutes=5)
+        self.assertEqual(e.reason, "window_too_short")
+
+    def test_no_intraday_data_reports_an_incomplete_opening_range(self):
+        e = find_orb_entry([], self.OPEN, self.ADV, self.TICK)
+        self.assertEqual(e.reason, "or_incomplete")
+
+
 class EndToEndTests(unittest.TestCase):
     OPEN = datetime(2026, 1, 5, 9, 15)
 
-    def intraday(self, volumes: list[float]) -> list[Candle]:
-        return [
+    def intraday(self, first_bar_volume: float, breakout: bool = True) -> list[Candle]:
+        """Bar 1 carries the volume; bar 2 breaks the opening-range high."""
+        bars = [
+            Candle(self.OPEN, 100.0, 101.0, 99.0, 100.5, first_bar_volume),
             Candle(
-                ts=self.OPEN + timedelta(minutes=i),
-                open=100.0,
-                high=101.0,
-                low=99.0,
-                close=100.5,
-                volume=v,
-            )
-            for i, v in enumerate(volumes)
+                self.OPEN + timedelta(minutes=5),
+                100.5,
+                105.0 if breakout else 100.9,
+                100.0,
+                104.0 if breakout else 100.5,
+                2000.0,
+            ),
         ]
+        price = 104.0 if breakout else 100.4
+        for i in range(2, 40):
+            if not breakout:
+                price -= 0.05          # never comes back to the opening-range high
+            else:
+                price += 0.5 if i < 30 else -4.0
+            bars.append(
+                Candle(
+                    self.OPEN + timedelta(minutes=5 * i),
+                    price,
+                    price + 0.4,
+                    price - 0.4,
+                    price,
+                    500.0,
+                )
+            )
+        return bars
 
-    def test_triggered_setup_with_rvol_breach_is_executable(self):
-        h4 = extend(uptrend(), (181.0, 178.0), (178.0, 176.0), (176.5, 184.0))
-        plan = build_trade_plan(h4, self.intraday([1000.0] * 10), self.OPEN, adv=100_000, config=CFG)
+    def h4(self) -> list[Candle]:
+        return extend(uptrend(), (181.0, 178.0), (178.0, 176.0), (176.5, 184.0))
+
+    def test_triggered_setup_with_rvol_breach_and_breakout_is_executable(self):
+        plan = build_trade_plan(self.h4(), self.intraday(12_000.0), self.OPEN, 100_000.0, CFG)
         self.assertIsNotNone(plan)
-        self.assertTrue(plan.executable)
         self.assertIs(plan.setup.status, SetupStatus.TRIGGERED)
+        self.assertTrue(plan.entry.filled)
+        self.assertTrue(plan.executable)
+        self.assertTrue(plan.rvol.passed)
 
-    def test_triggered_setup_without_rvol_breach_is_not_executable(self):
-        h4 = extend(uptrend(), (181.0, 178.0), (178.0, 176.0), (176.5, 184.0))
-        plan = build_trade_plan(h4, self.intraday([100.0] * 10), self.OPEN, adv=100_000, config=CFG)
+    def test_no_rvol_breach_means_no_entry(self):
+        plan = build_trade_plan(self.h4(), self.intraday(100.0), self.OPEN, 100_000.0, CFG)
         self.assertFalse(plan.executable)
+        self.assertEqual(plan.entry.reason, "no_rvol")
         self.assertIsNone(plan.exit_signal)
 
+    def test_rvol_breach_without_a_breakout_means_no_entry(self):
+        plan = build_trade_plan(
+            self.h4(), self.intraday(12_000.0, breakout=False), self.OPEN, 100_000.0, CFG
+        )
+        self.assertFalse(plan.executable)
+        self.assertEqual(plan.entry.reason, "no_breakout")
+
+    def test_the_chandelier_exit_is_found_after_the_fill(self):
+        plan = build_trade_plan(self.h4(), self.intraday(12_000.0), self.OPEN, 100_000.0, CFG)
+        self.assertIsNotNone(plan.exit_signal)
+        self.assertGreaterEqual(plan.exit_signal.index, plan.entry.fill_index)
+
     def test_no_setup_returns_none(self):
-        plan = build_trade_plan(uptrend(), self.intraday([1000.0] * 10), self.OPEN, adv=100_000, config=CFG)
+        plan = build_trade_plan(uptrend(), self.intraday(12_000.0), self.OPEN, 100_000.0, CFG)
         self.assertIsNone(plan)
 
 

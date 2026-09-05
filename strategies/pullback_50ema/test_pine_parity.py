@@ -183,3 +183,125 @@ class PineParityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Intraday ORB entry: Pine transliteration vs find_orb_entry
+# ---------------------------------------------------------------------------
+
+from datetime import datetime as _dt, timedelta as _td  # noqa: E402
+
+from strategy import find_orb_entry  # noqa: E402
+
+SESSION_OPEN = _dt(2026, 1, 5, 9, 15)
+
+
+def pine_orb_entry(bars, session_open, adv, tick, or_min, entry_win, rvol_min, thr, tf_mins=5.0):
+    """Transliteration of the entry block in the .pine file.
+
+    Pine evaluates a bar at its close: accumulate volume, extend the opening
+    range, latch RVOL, then place or cancel the resting order. The broker
+    emulator fills that order during the FOLLOWING bar.
+    """
+    cum = 0.0
+    or_high = None
+    rvol_ok = False
+    pending = None
+    bad_config = entry_win <= or_min
+
+    for i, c in enumerate(bars):
+        m = (c.ts - session_open).total_seconds() / 60.0
+        if m < 0:
+            continue
+        if pending is not None and c.high >= pending:
+            return (True, i, pending)
+        cum += c.volume
+        if m < or_min:
+            or_high = c.high if or_high is None else max(or_high, c.high)
+        if m < rvol_min and adv > 0 and cum / adv >= thr:
+            rvol_ok = True
+        nxt = m + tf_mins
+        may = (nxt >= or_min) and (nxt < entry_win) and not bad_config
+        pending = or_high + tick if (may and rvol_ok and or_high is not None) else None
+    return (False, None, None if or_high is None else or_high + tick)
+
+
+def random_intraday(n: int, seed: int):
+    rnd = random.Random(seed)
+    price = 100.0
+    out = []
+    for i in range(n):
+        price += rnd.gauss(0.0, 0.9)
+        rng = abs(rnd.gauss(0.0, 0.6)) + 0.05
+        out.append(
+            Candle(
+                ts=SESSION_OPEN + _td(minutes=5 * i),
+                open=price,
+                high=price + rng,
+                low=price - rng,
+                close=price,
+                volume=rnd.choice([200.0, 1500.0, 4000.0, 9500.0]),
+            )
+        )
+    return out
+
+
+class OrbEntryParityTests(unittest.TestCase):
+    ADV = 100_000.0
+    TICK = 0.05
+    THR = 0.09
+
+    WINDOWS = [(5, 15, 15), (5, 10, 10), (5, 15, 10), (10, 15, 15), (5, 30, 15), (5, 5, 15)]
+
+    def test_parity_across_window_settings_and_random_sessions(self):
+        fills = 0
+        for or_min, entry_win, rvol_min in self.WINDOWS:
+            for seed in range(120):
+                bars = random_intraday(8, seed)
+                pine = pine_orb_entry(
+                    bars, SESSION_OPEN, self.ADV, self.TICK, or_min, entry_win, rvol_min, self.THR
+                )
+                ref = find_orb_entry(
+                    bars, SESSION_OPEN, self.ADV, self.TICK,
+                    or_minutes=or_min, entry_window_minutes=entry_win,
+                    rvol_window_minutes=rvol_min, rvol_threshold=self.THR,
+                )
+                ctx = f"or={or_min} win={entry_win} rvol={rvol_min} seed={seed}"
+                self.assertEqual(pine[0], ref.filled, ctx)
+                if ref.filled:
+                    self.assertEqual(pine[1], ref.fill_index, ctx)
+                    self.assertAlmostEqual(pine[2], ref.level, msg=ctx)
+                    fills += 1
+        self.assertGreater(fills, 50, "too few fills for the parity check to be meaningful")
+
+    def test_the_default_5_15_setup_fills_on_the_second_bar(self):
+        bars = [
+            Candle(SESSION_OPEN, 100.0, 101.0, 99.0, 100.0, 9000.0),
+            Candle(SESSION_OPEN + _td(minutes=5), 100.0, 105.0, 99.0, 104.0, 500.0),
+        ]
+        self.assertEqual(
+            pine_orb_entry(bars, SESSION_OPEN, self.ADV, self.TICK, 5, 15, 15, self.THR),
+            (True, 1, 101.05),
+        )
+
+    def test_the_default_5_15_setup_also_fills_on_the_third_bar(self):
+        bars = [
+            Candle(SESSION_OPEN, 100.0, 101.0, 99.0, 100.0, 4000.0),
+            Candle(SESSION_OPEN + _td(minutes=5), 100.0, 100.9, 99.0, 100.5, 5000.0),
+            Candle(SESSION_OPEN + _td(minutes=10), 100.5, 106.0, 100.0, 105.0, 500.0),
+        ]
+        self.assertEqual(
+            pine_orb_entry(bars, SESSION_OPEN, self.ADV, self.TICK, 5, 15, 15, self.THR),
+            (True, 2, 101.05),
+        )
+
+    def test_the_fourth_bar_is_outside_the_window(self):
+        bars = [
+            Candle(SESSION_OPEN, 100.0, 101.0, 99.0, 100.0, 9000.0),
+            Candle(SESSION_OPEN + _td(minutes=5), 100.0, 100.9, 99.0, 100.5, 500.0),
+            Candle(SESSION_OPEN + _td(minutes=10), 100.5, 100.9, 100.0, 100.5, 500.0),
+            Candle(SESSION_OPEN + _td(minutes=15), 100.5, 200.0, 100.0, 199.0, 500.0),
+        ]
+        self.assertEqual(
+            pine_orb_entry(bars, SESSION_OPEN, self.ADV, self.TICK, 5, 15, 15, self.THR)[0], False
+        )

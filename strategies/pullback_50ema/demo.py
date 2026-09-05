@@ -1,5 +1,7 @@
 """End-to-end walkthrough on synthetic data.
 
+5-minute opening range, 15-minute entry window, 9% RVOL, long only.
+
     python3 strategies/pullback_50ema/demo.py
 """
 
@@ -35,24 +37,25 @@ def h4_series() -> list[Candle]:
     return candles
 
 
-def intraday_series(open_minute_volumes: list[float]) -> list[Candle]:
+def intraday_series(bar1_volume: float) -> list[Candle]:
+    """5-minute bars. Bar 1 sets the opening range and carries the volume;
+    bar 2 breaks out; then a drift up and a slide through the Chandelier."""
     bars = [
-        Candle(SESSION_OPEN + timedelta(minutes=i), 182.0, 183.0, 181.5, 182.5, v)
-        for i, v in enumerate(open_minute_volumes)
+        Candle(SESSION_OPEN, 182.0, 183.0, 181.5, 182.5, bar1_volume),
+        Candle(SESSION_OPEN + timedelta(minutes=5), 182.5, 186.0, 182.2, 185.5, 2e4),
     ]
-    # Quiet drift, then a slide that closes through the Chandelier line.
-    price = 182.5
-    for i in range(len(bars), 120):
-        price += 0.4 if i < 90 else -3.0
+    price = 185.5
+    for i in range(2, 60):
+        price += 0.4 if i < 45 else -3.0
         bars.append(
-            Candle(SESSION_OPEN + timedelta(minutes=i), price, price + 0.6, price - 0.6, price, 2e4)
+            Candle(SESSION_OPEN + timedelta(minutes=5 * i), price, price + 0.6, price - 0.6, price, 2e4)
         )
     return bars
 
 
 def main() -> None:
     h4 = h4_series()
-    adv = 1_000_000.0
+    adv = 1_000_000.0   # 20-day average daily volume
 
     print("=== Stage 1-3: 4H structural scan ===")
     for s in scan_4h(h4, CONFIG):
@@ -62,19 +65,18 @@ def main() -> None:
             f"entry={s.entry_price} stop={s.protective_stop}"
         )
 
-    for label, volumes in (
-        ("RVOL breach", [12_000.0] * 10),
-        ("RVOL miss", [500.0] * 10),
-    ):
+    for label, bar1_volume in (("RVOL breach", 120_000.0), ("RVOL miss", 5_000.0)):
         print(f"\n=== {label} ===")
-        plan = build_trade_plan(h4, intraday_series(volumes), SESSION_OPEN, adv, CONFIG)
+        plan = build_trade_plan(h4, intraday_series(bar1_volume), SESSION_OPEN, adv, CONFIG)
         if plan is None:
             print("  no actionable 4H setup")
             continue
         print(f"  setup      : {plan.setup.direction.name} {plan.setup.status.value}")
-        print(f"  entry      : {plan.setup.entry_price}  (stop {plan.setup.protective_stop})")
+        print(f"  4H trigger : {plan.setup.entry_price}  (4H stop {plan.setup.protective_stop})")
+        print(f"  OR (5m)    : high {plan.entry.opening_range.high} over {plan.entry.opening_range.bars} bar(s)")
         print(f"  {plan.rvol}")
         print(f"  breach at  : {plan.rvol.breach_ts}")
+        print(f"  {plan.entry}")
         print(f"  executable : {plan.executable}")
         if plan.exit_signal:
             e = plan.exit_signal

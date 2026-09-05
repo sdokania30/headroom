@@ -1,4 +1,4 @@
-# 4H 50-EMA Pullback → RVOL → 10-Min HOD — Long Only
+# 4H 50-EMA Pullback → RVOL → 5-Min ORB — Long Only
 
 Two deliverables from one ruleset:
 
@@ -6,8 +6,8 @@ Two deliverables from one ruleset:
 |---|---|
 | `pine/rvol_hod_swing_long.pine` | **The tradeable strategy.** Pine Script v6, long only, for a 5-minute chart. |
 | `strategy.py` | Reference implementation of the same logic in Python — the executable spec the Pine was derived from. |
-| `test_strategy.py` | 32 unit tests of the reference implementation. |
-| `test_pine_parity.py` | 7 tests asserting the Pine state machine and the Python reference fire identically. |
+| `test_strategy.py` | 46 unit tests of the reference implementation. |
+| `test_pine_parity.py` | 11 tests asserting the Pine logic and the Python reference behave identically. |
 | `demo.py` | Synthetic end-to-end walkthrough. |
 
 ```bash
@@ -22,25 +22,36 @@ python3 demo.py
 
 Apply to a **5-minute chart**. Long only. Positions are held as swings, across days.
 
-### Entry — all three, inside the first 10 minutes of the session
+### Entry — all three, inside the first 15 minutes of the session
 
 1. **4H setup live** (`useH4`, default on) — the 4H 50-EMA pullback is armed or has broken out within the last 6 bars.
-2. **RVOL gate** — cumulative session volume ≥ 9% of the 20-day ADV, latched on a completed bar inside the window.
-3. **10-min HOD** — a buy-stop 1 tick above the running high of day fills.
+2. **RVOL gate** — cumulative session volume ≥ 9% of the 20-day ADV, latched on a bar that has already **closed**.
+3. **5-min ORB** — a buy-stop 1 tick above the **opening-range high** (the first 5 minutes) fills.
 
-### The consequence of a strict 10-minute window
+### The two windows
 
-On a 5-minute chart the window holds exactly two bars:
+They are separate inputs and do different jobs:
+
+| Input | Default | Job |
+|---|---|---|
+| `orMinutes` | 5 | Defines the breakout **level**: 1 tick above the high of the first 5 minutes. |
+| `entryWindow` | 15 | Defines how long the order may **work**. |
+| `rvolMinutes` | 15 | Defines how long the RVOL gate may **latch**. Set to 10 for the original "RVOL within 10 minutes" rule. |
+
+On a 5-minute chart that lays out as:
 
 | Bar | Clock | What happens |
 |---|---|---|
-| 1 | 09:15–09:20 | Volume accumulates. If RVOL ≥ 9% at this close, the buy-stop is placed at bar 1's high + 1 tick. |
-| 2 | 09:20–09:25 | The order is live. A break of bar 1's high fills it. |
-| 3 | 09:25+ | Window shut. Any working order is cancelled. |
+| 1 | 09:15–09:20 | Sets the opening range. Volume accumulates. If RVOL ≥ 9% at this close, the buy-stop goes in at OR high + 1 tick. |
+| 2 | 09:20–09:25 | Order live — fills on a break of the OR high. If RVOL only reaches 9% at *this* close, the order goes in now instead. |
+| 3 | 09:25–09:30 | Last fillable bar. |
+| 4 | 09:30+ | Window shut, any working order cancelled, day done. |
 
-So **the RVOL must breach on bar 1.** A breach at bar 2's close leaves no bar inside the window for a fill, and the day is skipped. That is the strict reading of "RVOL within 10 minutes" *and* "entry within 10 min HOD" together — the order is only ever placed while the next bar still opens inside the window (`orderMayWork`).
+So you get **two chances to fill**, and the RVOL has until bar 2's close to latch. That is the practical difference from a 10-minute window, which allowed one fill attempt and demanded the RVOL latch on bar 1.
 
-If that proves too selective in backtest, the lever is `orMinutes`. At 15 you get two fillable bars, at 30 you get five. Nothing else needs to change.
+An order can never fill on the bar that placed it — it is a resting stop, and it only becomes live on the following bar. The code enforces this on both sides (`orderMayWork` in Pine, the latch-before-fill ordering in `find_orb_entry`).
+
+`entryWindow` must be greater than `orMinutes` or nothing can ever fill; the status table flags `BAD CONFIG` if you set it that way.
 
 ### Exit
 
@@ -52,7 +63,9 @@ If that proves too selective in backtest, the lever is `orMinutes`. At 15 you ge
 | Input | Default | Note |
 |---|---|---|
 | `sessTime` | `0915-1530` | NSE cash. Chart timezone must match. |
-| `orMinutes` | `10` | Entry window length. The main sensitivity knob. |
+| `orMinutes` | `5` | Opening range — sets the breakout level. |
+| `entryWindow` | `15` | How long the order may work. The main sensitivity knob. |
+| `rvolMinutes` | `15` | How long the RVOL gate may latch. |
 | `rvolPct` | `9.0` | Share of 20-day ADV. |
 | `useH4` | `on` | Toggle the 4H filter to measure what it is worth. |
 | `chandTF` | `D` | **See below.** Empty string = chart timeframe. |
@@ -78,8 +91,8 @@ Every higher-timeframe read uses `barmerge.lookahead_off`. The 4H state machine 
 | 2b | Cancellation: "gone through the 50 EMA" | candle **body** entirely below the EMA, or a close below it | — |
 | 2c | "Respect / bounce from the 50 EMA zone" | wicks may pierce the EMA freely | — |
 | 3 | Entry 1 pip above the first pullback bar's wick | `first_pullback.high + syminfo.mintick` | — |
-| 4 | Daily cumulative RVOL ≥ 9% in the first 10 minutes | Σ session volume ÷ 20-day ADV ≥ 0.09, latched inside the window | `rvolPct`, `advLen`, `orMinutes` |
-| 4b | Entry within the 10-min HOD | buy-stop 1 tick above the running HOD, working only while the next bar opens inside the window | `orMinutes` |
+| 4 | Daily cumulative RVOL ≥ 9% early in the session | Σ session volume ÷ 20-day ADV ≥ 0.09, latched on a closed bar inside `rvolMinutes` | `rvolPct`, `advLen`, `rvolMinutes` |
+| 4b | Entry on the opening-range breakout | buy-stop 1 tick above the 5-minute opening-range high, working only on bars opening in `[orMinutes, entryWindow)` | `orMinutes`, `entryWindow` |
 | 5 | Hold until an intraday candle closes below the Chandelier Exit | `HH(22) − 3×ATR(22)` on the daily, tested on intraday closes | `chandTF`, `chandLen`, `chandMult` |
 
 ### 4H setup lifecycle
@@ -123,12 +136,12 @@ The source rules were underspecified in eight places. Each is closed with an exp
 
 ## 4. What is still open
 
-1. **Not compiled on TradingView.** The Pine has never been through the TV compiler — no TV access from this environment. The *logic* is verified: `test_pine_parity.py` transliterates the Pine state machine line-for-line and asserts it fires identical breakouts to the tested Python reference across 60 random walks of 400 bars (579 matching breakouts) plus six hand-built edge cases. Syntax is the remaining risk, and it is a paste-and-see.
+1. **Not compiled on TradingView.** The Pine has never been through the TV compiler — no TV access from this environment. The *logic* is verified: `test_pine_parity.py` transliterates the Pine state machine line-for-line and asserts it fires identical breakouts to the tested Python reference across 60 random walks of 400 bars (579 matching breakouts) plus six hand-built edge cases, and does the same for the intraday entry across six window configurations and 720 synthetic sessions (88 matching fills). Syntax is the remaining risk, and it is a paste-and-see.
 2. **Nothing is backtested.** Every number is a default, not a fitted parameter. No walk-forward, no parameter sweep, no out-of-sample split.
 3. **Position sizing is 100% of equity per trade.** Change `default_qty_type` / `default_qty_value` before this means anything about returns.
 4. **Commission 0.03% and 2-tick slippage** are placeholders. Set them to your actual costs — an opening-range strategy is slippage-sensitive and these assumptions move the equity curve materially.
-5. **`orMinutes = 10` is severe on a 5-min chart** (see §1). Backtest 10 / 15 / 30 before concluding the edge is absent.
-6. **Gap-up days are not handled specially.** If the stock gaps and bar 1 is a large range, the buy-stop sits above an already-extended high. Consider a max-extension filter.
+5. **The window is still tight.** Two fill attempts per day. Backtest `entryWindow` at 15 / 30 / 60 before concluding the edge is absent.
+6. **Gap-up days are not handled specially.** If the stock gaps and bar 1 is a wide range, the buy-stop sits above an already-extended high and the initial stop is far away. Consider a maximum opening-range width filter (`orHigh - orLow` as a multiple of ATR).
 7. **The 4H bar boundary on NSE is awkward.** A 6h15m session does not divide into 4H bars cleanly. Verify what TradingView actually builds for your symbol before trusting `h4TF = 240`.
 
 ---
@@ -143,8 +156,10 @@ cfg = StrategyConfig(tick_size=TICK_NSE_EQUITY)   # long_only=True by default
 for setup in scan_4h(h4_candles, cfg):
     print(setup.direction, setup.status, setup.entry_price, setup.protective_stop)
 
-plan = build_trade_plan(h4_candles, minute_candles, session_open, adv, cfg)
-plan.executable   # triggered setup AND RVOL breach
+plan = build_trade_plan(h4_candles, minute_candles, session_open, adv, cfg,
+                        or_minutes=5, entry_window_minutes=15, rvol_window_minutes=15)
+plan.entry        # IntradayEntry: filled, level, fill_ts, opening_range, rvol, reason
+plan.executable   # triggered 4H setup AND the ORB entry actually filled
 ```
 
 `Candle` is `(ts, open, high, low, close, volume)`; timestamps are the bar's **open** time. Bring your own data — this module never fetches.

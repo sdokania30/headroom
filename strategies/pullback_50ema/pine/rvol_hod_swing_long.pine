@@ -1,24 +1,28 @@
 //@version=6
 // =============================================================================
-// RVOL 10-Min HOD Swing — Long Only
+// RVOL ORB Swing — Long Only
 // -----------------------------------------------------------------------------
 // Apply to a 5-MINUTE chart.
 //
-// Entry (all three must hold, inside the first `orMinutes` of the session):
+//   Opening range : first 5 minutes of the session (bar 1)
+//   Entry window  : first 15 minutes  (bars 2 and 3 are fillable)
+//   RVOL gate     : cumulative session volume >= 9% of the 20-day ADV
+//
+// Entry — all three must hold:
 //   1. Optional 4H 50-EMA pullback setup is live (trend + separation + >=2
 //      counter-trend bars that respect the EMA + breakout of the first
 //      pullback bar's high).
-//   2. Cumulative session volume >= `rvolPct`% of the 20-day average daily
-//      volume -- the RVOL gate, latched on a completed bar inside the window.
-//   3. Price takes out the running high of day: a buy-stop 1 tick above the
-//      HOD of the bars completed so far in the window.
+//   2. The RVOL gate has latched on a bar that has already CLOSED.
+//   3. A buy-stop 1 tick above the opening-range high fills, on a bar that
+//      opens at or after the end of the opening range and before the end of
+//      the entry window.
 //
-// The order is placed only while the NEXT bar still opens inside the window,
-// so on a 5-min chart with a 10-min window the RVOL must latch on bar 1 and
-// the fill happens on bar 2. Miss it and the day is skipped by design.
+// On a 5-min chart that gives two chances to fill: 09:20-09:25 (needs the RVOL
+// to latch on bar 1) and 09:25-09:30 (needs it by bar 2's close). After 09:30
+// any working order is cancelled and the day is done.
 //
 // Exit: an intraday close through the Chandelier Exit line (computed on the
-// daily timeframe by default -- see the note on `chandTF`), plus an optional
+// daily timeframe by default — see the note on `chandTF`), plus an optional
 // ATR initial stop that covers the trade before the trail is meaningful.
 //
 // Non-repainting: every higher-timeframe value is fetched with
@@ -26,7 +30,7 @@
 // bar has CLOSED, using that closed bar's OHLC.
 // =============================================================================
 
-strategy("RVOL 10-Min HOD Swing (Long)", shorttitle="RVOL-ORH Long", overlay=true,
+strategy("RVOL ORB Swing (Long)", shorttitle="RVOL-ORB Long", overlay=true,
      initial_capital        = 1000000,
      default_qty_type       = strategy.percent_of_equity,
      default_qty_value      = 100,
@@ -41,16 +45,20 @@ strategy("RVOL 10-Min HOD Swing (Long)", shorttitle="RVOL-ORH Long", overlay=tru
 // ----------------------------------------------------------------------------
 // Inputs
 // ----------------------------------------------------------------------------
-gSess = "Session & entry window"
-sessTime  = input.session("0915-1530", "Regular session", group = gSess,
+gSess = "Session, opening range & entry window"
+sessTime    = input.session("0915-1530", "Regular session", group = gSess,
      tooltip = "NSE cash is 0915-1530 IST. Set the chart timezone to match.")
-orMinutes = input.int(10, "Entry window from the open (minutes)", minval = 1, maxval = 240, group = gSess,
-     tooltip = "The order may only be WORKING inside this window. On a 5-min chart a 10-min window leaves exactly one fillable bar.")
+orMinutes   = input.int(5, "Opening range (minutes)", minval = 1, maxval = 240, group = gSess,
+     tooltip = "The breakout level is 1 tick above the high of this range. On a 5-min chart, 5 = the first bar.")
+entryWindow = input.int(15, "Entry window from the open (minutes)", minval = 2, maxval = 375, group = gSess,
+     tooltip = "The order may only be WORKING inside this window. Must be longer than the opening range. On a 5-min chart, 15 leaves two fillable bars.")
 
 gRvol = "RVOL gate"
-advLen  = input.int(20, "ADV lookback (days)", minval = 1, group = gRvol)
-rvolPct = input.float(9.0, "Cumulative volume as % of ADV", minval = 0.1, step = 0.5, group = gRvol,
+advLen     = input.int(20, "ADV lookback (days)", minval = 1, group = gRvol)
+rvolPct    = input.float(9.0, "Cumulative volume as % of ADV", minval = 0.1, step = 0.5, group = gRvol,
      tooltip = "Session volume accumulated so far, as a share of the 20-day average daily volume.")
+rvolMinutes = input.int(15, "RVOL measurement window (minutes)", minval = 1, maxval = 375, group = gRvol,
+     tooltip = "The gate can only latch inside this window. Set to 10 to restore the original 'RVOL within 10 minutes' rule.")
 
 gH4 = "4H 50-EMA pullback filter"
 useH4     = input.bool(true, "Require the 4H pullback setup", group = gH4)
@@ -76,12 +84,12 @@ eodExit     = input.bool(false, "Force flat at the session close", group = gExit
      tooltip = "Off by default. This is a swing strategy; positions are meant to be held overnight.")
 
 gViz = "Display"
-showEma    = input.bool(true,  "Plot the 4H 50 EMA", group = gViz)
-showLevels = input.bool(true,  "Plot the entry stop and the trail", group = gViz)
-showTable  = input.bool(true,  "Show the status table", group = gViz)
+showEma    = input.bool(true, "Plot the 4H 50 EMA", group = gViz)
+showLevels = input.bool(true, "Plot the opening range, entry stop and trail", group = gViz)
+showTable  = input.bool(true, "Show the status table", group = gViz)
 
 // ----------------------------------------------------------------------------
-// Session bookkeeping
+// Session, opening range and window arithmetic
 // ----------------------------------------------------------------------------
 inSess  = not na(time(timeframe.period, sessTime))
 newSess = inSess and not inSess[1]
@@ -89,27 +97,37 @@ tfMins  = timeframe.in_seconds(timeframe.period) / 60.0
 
 var int   sessOpenTime = na
 var float cumVol       = na
-var float hod          = na
+var float orHigh       = na
+var float orLow        = na
 var bool  rvolOK       = false
 var bool  tradedToday  = false
 
 if newSess
     sessOpenTime := time
     cumVol       := 0.0
-    hod          := na
+    orHigh       := na
+    orLow        := na
     rvolOK       := false
     tradedToday  := false
 
+// Minutes from the session open to THIS bar's open, and to its close.
+minsFromOpen = inSess and not na(sessOpenTime) ? (time - sessOpenTime) / 60000.0 : na
+nextOffset   = minsFromOpen + tfMins
+
+inOR       = inSess and not na(minsFromOpen) and minsFromOpen < orMinutes
+inEntryWin = inSess and not na(minsFromOpen) and minsFromOpen < entryWindow
+inRvolWin  = inSess and not na(minsFromOpen) and minsFromOpen < rvolMinutes
+
 if inSess
     cumVol := nz(cumVol) + volume
-    hod    := na(hod) ? high : math.max(hod, high)
+if inOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow, low)
 
-// Minutes from the session open to THIS bar's open.
-minsFromOpen = inSess and not na(sessOpenTime) ? (time - sessOpenTime) / 60000.0 : na
-inWindow     = inSess and not na(minsFromOpen) and minsFromOpen < orMinutes
-// True only while the NEXT bar also opens inside the window, i.e. while a
-// resting order still has somewhere legal to fill.
-orderMayWork = inWindow and (minsFromOpen + tfMins) < orMinutes
+// The order may be placed at this bar's close only while the NEXT bar is a
+// legal fill bar: it opens at or after the end of the opening range, and
+// before the end of the entry window.
+orderMayWork = inSess and not na(minsFromOpen) and nextOffset >= orMinutes and nextOffset < entryWindow
 
 // ----------------------------------------------------------------------------
 // RVOL gate: cumulative session volume as a share of the 20-day ADV
@@ -118,7 +136,7 @@ orderMayWork = inWindow and (minsFromOpen + tfMins) < orMinutes
 adv = request.security(syminfo.tickerid, "D", ta.sma(volume, advLen)[1], lookahead = barmerge.lookahead_off)
 
 rvolShare = na(adv) or adv <= 0 ? na : nz(cumVol) / adv
-if inWindow and not na(rvolShare) and rvolShare >= rvolPct / 100.0
+if inRvolWin and not na(rvolShare) and rvolShare >= rvolPct / 100.0
     rvolOK := true
 
 // ----------------------------------------------------------------------------
@@ -175,7 +193,7 @@ if newH4 and not na(h4Close[1]) and not na(h4Ema[1]) and not na(h4Atr[1]) and h4
     else if c < o
         // Counter-trend (red) bar inside the uptrend.
         if math.max(o, c) < e
-            // Body entirely below the EMA -- "gone through the 50 EMA, cancelled".
+            // Body entirely below the EMA — "gone through the 50 EMA, cancelled".
             kill := true
         else
             if pbCount == 0
@@ -215,13 +233,15 @@ if newH4 and not na(h4Close[1]) and not na(h4Ema[1]) and not na(h4Atr[1]) and h4
 h4Gate = not useH4 or h4Ready
 
 // ----------------------------------------------------------------------------
-// Entry: buy-stop 1 tick above the running high of day, inside the window
+// Entry: buy-stop 1 tick above the opening-range high
 // ----------------------------------------------------------------------------
-entryStop = na(hod) ? na : hod + syminfo.mintick
-canWork   = orderMayWork and rvolOK and h4Gate and strategy.position_size == 0 and not tradedToday and not na(entryStop)
+badConfig = entryWindow <= orMinutes
+entryStop = na(orHigh) ? na : orHigh + syminfo.mintick
+canWork   = orderMayWork and not badConfig and rvolOK and h4Gate and
+             strategy.position_size == 0 and not tradedToday and not na(entryStop)
 
 if canWork
-    strategy.entry("Long", strategy.long, stop = entryStop, comment = "RVOL+HOD")
+    strategy.entry("Long", strategy.long, stop = entryStop, comment = "RVOL+ORB")
 else
     strategy.cancel("Long")
 
@@ -260,6 +280,8 @@ if strategy.position_size > 0
 // Display
 // ----------------------------------------------------------------------------
 plot(showEma ? h4Ema : na, "4H 50 EMA", color.new(color.orange, 0), linewidth = 2)
+plot(showLevels and inSess ? orHigh : na, "OR high", color.new(color.blue, 20), style = plot.style_linebr)
+plot(showLevels and inSess ? orLow  : na, "OR low",  color.new(color.blue, 60), style = plot.style_linebr)
 plot(showLevels and canWork ? entryStop : na, "Entry stop", color.new(color.teal, 0),
      style = plot.style_linebr, linewidth = 2)
 plot(showLevels and strategy.position_size > 0 ? trail : na, "Chandelier", color.new(color.red, 0),
@@ -267,29 +289,32 @@ plot(showLevels and strategy.position_size > 0 ? trail : na, "Chandelier", color
 plot(showLevels and strategy.position_size > 0 ? initStop : na, "Initial stop", color.new(color.maroon, 40),
      style = plot.style_linebr)
 
-bgcolor(inWindow ? color.new(color.blue, 92) : na, title = "Entry window")
-bgcolor(inWindow and rvolOK ? color.new(color.green, 82) : na, title = "RVOL breached")
+bgcolor(inOR ? color.new(color.blue, 85) : inEntryWin ? color.new(color.blue, 93) : na, title = "OR / entry window")
+bgcolor(inEntryWin and rvolOK ? color.new(color.green, 82) : na, title = "RVOL breached")
 
 plotshape(justEntered, "Entry", shape.triangleup, location.belowbar, color.new(color.teal, 0), size = size.tiny)
 
-var table info = table.new(position.top_right, 2, 5, border_width = 1)
+var table info = table.new(position.top_right, 2, 6, border_width = 1)
 if showTable and barstate.islast
     table.cell(info, 0, 0, "RVOL (session / ADV)", text_halign = text.align_left, text_size = size.small)
     table.cell(info, 1, 0, na(rvolShare) ? "n/a" : str.tostring(rvolShare * 100, "#.##") + "%",
          text_size = size.small, bgcolor = rvolOK ? color.new(color.green, 70) : color.new(color.red, 80))
     table.cell(info, 0, 1, "Threshold", text_halign = text.align_left, text_size = size.small)
     table.cell(info, 1, 1, str.tostring(rvolPct, "#.##") + "%", text_size = size.small)
-    table.cell(info, 0, 2, "4H setup", text_halign = text.align_left, text_size = size.small)
-    table.cell(info, 1, 2, not useH4 ? "off" : h4Ready ? "ready" : "none", text_size = size.small,
+    table.cell(info, 0, 2, "OR high (" + str.tostring(orMinutes) + "m)", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 2, na(orHigh) ? "-" : str.tostring(orHigh, format.mintick), text_size = size.small)
+    table.cell(info, 0, 3, "4H setup", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 3, not useH4 ? "off" : h4Ready ? "ready" : "none", text_size = size.small,
          bgcolor = h4Gate ? color.new(color.green, 70) : color.new(color.red, 80))
-    table.cell(info, 0, 3, "4H trigger", text_halign = text.align_left, text_size = size.small)
-    table.cell(info, 1, 3, na(h4Trigger) ? "-" : str.tostring(h4Trigger, format.mintick), text_size = size.small)
-    table.cell(info, 0, 4, "Entry window", text_halign = text.align_left, text_size = size.small)
-    table.cell(info, 1, 4, inWindow ? "open" : "closed", text_size = size.small)
+    table.cell(info, 0, 4, "4H trigger", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 4, na(h4Trigger) ? "-" : str.tostring(h4Trigger, format.mintick), text_size = size.small)
+    table.cell(info, 0, 5, "Entry window (" + str.tostring(entryWindow) + "m)", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 5, badConfig ? "BAD CONFIG" : inEntryWin ? "open" : "closed", text_size = size.small,
+         bgcolor = badConfig ? color.new(color.red, 50) : na)
 
 // ----------------------------------------------------------------------------
 // Alerts
 // ----------------------------------------------------------------------------
 alertcondition(canWork and not canWork[1], "Order working",
-     "RVOL gate passed and the buy-stop is working above the high of day.")
-alertcondition(justEntered, "Long entry filled", "Long filled on the 10-minute HOD breakout.")
+     "RVOL gate passed; buy-stop working above the opening-range high.")
+alertcondition(justEntered, "Long entry filled", "Long filled on the opening-range breakout.")

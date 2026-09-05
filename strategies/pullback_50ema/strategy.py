@@ -428,6 +428,103 @@ def evaluate_rvol_gate(
 
 
 # ---------------------------------------------------------------------------
+# Stage 4b: opening range and the ORB entry
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OpeningRange:
+    high: Optional[float]
+    low: Optional[float]
+    bars: int
+    minutes: int
+
+    @property
+    def complete(self) -> bool:
+        return self.bars > 0 and self.high is not None
+
+
+@dataclass(frozen=True)
+class IntradayEntry:
+    filled: bool
+    level: Optional[float]
+    fill_ts: Optional[datetime]
+    fill_index: Optional[int]
+    opening_range: OpeningRange
+    rvol: RvolGate
+    reason: str   # filled | window_too_short | or_incomplete | no_rvol | no_breakout
+
+    def __str__(self) -> str:
+        if self.filled:
+            return f"ENTRY filled at {self.level} on {self.fill_ts}"
+        return f"NO ENTRY ({self.reason})"
+
+
+def opening_range(
+    intraday_candles: Sequence[Candle], session_open: datetime, minutes: int = 5
+) -> OpeningRange:
+    """High/low of the bars opening in ``[session_open, session_open + minutes)``."""
+    end = session_open + timedelta(minutes=minutes)
+    hi: Optional[float] = None
+    lo: Optional[float] = None
+    n = 0
+    for c in intraday_candles:
+        if c.ts < session_open or c.ts >= end:
+            continue
+        hi = c.high if hi is None else max(hi, c.high)
+        lo = c.low if lo is None else min(lo, c.low)
+        n += 1
+    return OpeningRange(high=hi, low=lo, bars=n, minutes=minutes)
+
+
+def find_orb_entry(
+    intraday_candles: Sequence[Candle],
+    session_open: datetime,
+    adv: float,
+    tick_size: float,
+    or_minutes: int = 5,
+    entry_window_minutes: int = 15,
+    rvol_window_minutes: int = 15,
+    rvol_threshold: float = 0.09,
+) -> IntradayEntry:
+    """Long entry: a buy-stop 1 tick above the opening-range high, working only
+    while the RVOL gate has latched and the bar opens inside the entry window.
+
+    Mirrors the Pine implementation exactly. A bar at offset ``k`` minutes from
+    the open is fillable when ``or_minutes <= k < entry_window_minutes``, and the
+    RVOL gate must already have latched on an EARLIER bar's close -- an order
+    cannot be resting during a bar it was only placed at the end of.
+    """
+    orng = opening_range(intraday_candles, session_open, or_minutes)
+    gate = evaluate_rvol_gate(
+        intraday_candles, session_open, adv, rvol_threshold, rvol_window_minutes
+    )
+
+    def result(filled, level, ts, idx, reason):
+        return IntradayEntry(filled, level, ts, idx, orng, gate, reason)
+
+    if entry_window_minutes <= or_minutes:
+        return result(False, None, None, None, "window_too_short")
+    if not orng.complete:
+        return result(False, None, None, None, "or_incomplete")
+
+    level = orng.high + tick_size
+    cumulative = 0.0
+    latched = False   # RVOL state as of the previous bar's close
+    for i, c in enumerate(intraday_candles):
+        offset = (c.ts - session_open).total_seconds() / 60.0
+        if offset < 0:
+            continue
+        if offset >= entry_window_minutes:
+            break
+        if latched and offset >= or_minutes and c.high >= level:
+            return result(True, level, c.ts, i, "filled")
+        cumulative += c.volume
+        if offset < rvol_window_minutes and cumulative / adv >= rvol_threshold:
+            latched = True
+    return result(False, level, None, None, "no_breakout" if gate.passed else "no_rvol")
+
+
+# ---------------------------------------------------------------------------
 # Stage 5: Chandelier Exit
 # ---------------------------------------------------------------------------
 
@@ -502,12 +599,16 @@ def find_chandelier_exit(
 @dataclass(frozen=True)
 class TradePlan:
     setup: Setup
-    rvol: RvolGate
+    entry: IntradayEntry
     exit_signal: Optional[ExitSignal]
 
     @property
+    def rvol(self) -> RvolGate:
+        return self.entry.rvol
+
+    @property
     def executable(self) -> bool:
-        return self.setup.status is SetupStatus.TRIGGERED and self.rvol.passed
+        return self.setup.status is SetupStatus.TRIGGERED and self.entry.filled
 
 
 def build_trade_plan(
@@ -516,30 +617,37 @@ def build_trade_plan(
     session_open: datetime,
     adv: float,
     config: Optional[StrategyConfig] = None,
+    or_minutes: int = 5,
+    entry_window_minutes: int = 15,
+    rvol_window_minutes: int = 15,
     rvol_threshold: float = 0.09,
-    rvol_window_minutes: int = 10,
     chandelier_period: int = 22,
     chandelier_multiplier: float = 3.0,
 ) -> Optional[TradePlan]:
-    """Run all three gates for a single breakout day. Returns ``None`` if no
-    4H setup is actionable in the supplied window."""
-    setups = [s for s in scan_4h(h4_candles, config) if s.is_actionable]
+    """Run every gate for a single breakout day. ``None`` when no 4H setup is
+    actionable in the supplied window."""
+    cfg = config or StrategyConfig()
+    setups = [s for s in scan_4h(h4_candles, cfg) if s.is_actionable]
     if not setups:
         return None
     setup = setups[-1]
-    gate = evaluate_rvol_gate(
-        intraday_candles, session_open, adv, rvol_threshold, rvol_window_minutes
+    entry = find_orb_entry(
+        intraday_candles,
+        session_open,
+        adv,
+        cfg.tick_size,
+        or_minutes,
+        entry_window_minutes,
+        rvol_window_minutes,
+        rvol_threshold,
     )
     exit_signal = None
-    if setup.status is SetupStatus.TRIGGERED and gate.passed and gate.breach_ts is not None:
-        entry_index = next(
-            (i for i, c in enumerate(intraday_candles) if c.ts >= gate.breach_ts), 0
-        )
+    if setup.status is SetupStatus.TRIGGERED and entry.filled and entry.fill_index is not None:
         exit_signal = find_chandelier_exit(
             intraday_candles,
             setup.direction,
-            entry_index,
+            entry.fill_index,
             chandelier_period,
             chandelier_multiplier,
         )
-    return TradePlan(setup=setup, rvol=gate, exit_signal=exit_signal)
+    return TradePlan(setup=setup, entry=entry, exit_signal=exit_signal)
