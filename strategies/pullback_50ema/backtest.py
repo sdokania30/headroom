@@ -20,7 +20,7 @@ import csv
 import math
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from typing import Optional, Sequence
 
@@ -41,6 +41,7 @@ class BacktestConfig:
     adv_lookback: int = 20
     use_h4: bool = True
     h4_minutes: int = 240
+    max_or_atr: Optional[float] = None   # skip the day when the OR is wider than this x daily ATR
     # Exit
     chandelier_period: int = 22
     chandelier_multiplier: float = 3.0
@@ -84,6 +85,7 @@ class BacktestResult:
     skipped_no_rvol: int = 0
     skipped_no_breakout: int = 0
     skipped_no_h4: int = 0
+    skipped_wide_or: int = 0
     config: Optional[BacktestConfig] = None
     open_trade: Optional[tuple[datetime, float, int]] = None
 
@@ -191,15 +193,19 @@ def run_backtest(
         flags = h4_ready_series([b for b, _ in pairs], scfg)
         h4_ready = [(close_ts, flag) for (_, close_ts), flag in zip(pairs, flags)]
 
+    # Bars are walked in order, so the 4H cursor only ever moves forward.
+    # A rescan per bar would be O(bars x 4H bars) and crawls on real data.
+    h4_cursor = 0
+    h4_state = False
+
     def h4_ok(ts: datetime) -> bool:
+        nonlocal h4_cursor, h4_state
         if not cfg.use_h4:
             return True
-        state = False
-        for close_ts, flag in h4_ready:
-            if close_ts > ts:
-                break
-            state = flag
-        return state
+        while h4_cursor < len(h4_ready) and h4_ready[h4_cursor][0] <= ts:
+            h4_state = h4_ready[h4_cursor][1]
+            h4_cursor += 1
+        return h4_state
 
     slip = cfg.slippage_ticks * cfg.tick_size
     equity = cfg.capital
@@ -254,6 +260,8 @@ def run_backtest(
 
         cum_vol = 0.0
         or_high: Optional[float] = None
+        or_low: Optional[float] = None
+        or_too_wide = False
         rvol_ok = False
         pending: Optional[float] = None
         traded_today = False
@@ -311,6 +319,9 @@ def run_backtest(
             cum_vol += bar.volume
             if mins < cfg.or_minutes:
                 or_high = bar.high if or_high is None else max(or_high, bar.high)
+                or_low = bar.low if or_low is None else min(or_low, bar.low)
+                if cfg.max_or_atr is not None and atr_d is not None and or_low is not None:
+                    or_too_wide = (or_high - or_low) > cfg.max_or_atr * atr_d
             if mins < cfg.rvol_window_minutes and adv > 0 and cum_vol / adv >= cfg.rvol_threshold:
                 if not rvol_ok:
                     latched_in_window = True
@@ -322,7 +333,7 @@ def run_backtest(
                 and nxt >= cfg.or_minutes
                 and nxt < cfg.entry_window_minutes
             )
-            gate = rvol_ok and h4_ok(bar.ts)
+            gate = rvol_ok and h4_ok(bar.ts) and not or_too_wide
             if gate and may_work:
                 saw_setup = True
             pending = (
@@ -338,6 +349,8 @@ def run_backtest(
                 result.skipped_no_breakout += 1
         elif not latched_in_window:
             result.skipped_no_rvol += 1
+        elif or_too_wide:
+            result.skipped_wide_or += 1
         else:
             result.skipped_no_h4 += 1
 
@@ -464,6 +477,7 @@ def format_summary(result: BacktestResult) -> str:
         f"  Sessions tested         {result.sessions:>14}",
         f"  Days with no RVOL       {result.skipped_no_rvol:>14}",
         f"  Days blocked by 4H      {result.skipped_no_h4:>14}",
+        f"  Days with a wide open   {result.skipped_wide_or:>14}",
         f"  Days armed but no fill  {result.skipped_no_breakout:>14}",
         f"  Days filled             {s.trades + (1 if result.open_trade else 0):>14}",
     ]
@@ -487,6 +501,109 @@ def write_trades_csv(result: BacktestResult, path: str) -> None:
                         t.quantity, f"{t.gross_pnl:.2f}", f"{t.costs:.2f}", f"{t.pnl:.2f}",
                         f"{t.pnl_pct:.4f}", t.bars_held, f"{t.mae_pct:.2f}",
                         f"{t.mfe_pct:.2f}", t.exit_reason])
+
+
+# ---------------------------------------------------------------------------
+# Parameter sweep
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SweepRow:
+    or_minutes: int
+    entry_window: int
+    rvol_pct: float
+    use_h4: bool
+    trades: int
+    win_rate: float
+    net_profit: float
+    return_pct: float
+    profit_factor: Optional[float]
+    expectancy: float
+    max_dd_pct: float
+    days_filled: int
+    days_no_rvol: int
+
+
+def run_sweep(
+    candles: Sequence[Candle],
+    base: BacktestConfig,
+    strategy_config: StrategyConfig,
+    or_list: Sequence[int],
+    window_list: Sequence[int],
+    rvol_list: Sequence[float],
+    h4_list: Sequence[bool],
+) -> list[SweepRow]:
+    """Grid over opening range x entry window x RVOL threshold x 4H filter.
+
+    Combinations where the entry window is not longer than the opening range
+    can never fill and are skipped rather than reported as zero-trade rows.
+    """
+    rows: list[SweepRow] = []
+    for orm in or_list:
+        for win in window_list:
+            if win <= orm:
+                continue
+            for rv in rvol_list:
+                for h4 in h4_list:
+                    cfg = replace(
+                        base,
+                        or_minutes=orm,
+                        entry_window_minutes=win,
+                        rvol_window_minutes=win,
+                        rvol_threshold=rv / 100.0,
+                        use_h4=h4,
+                    )
+                    r = run_backtest(candles, cfg, strategy_config)
+                    s = summarise(r)
+                    rows.append(
+                        SweepRow(
+                            or_minutes=orm,
+                            entry_window=win,
+                            rvol_pct=rv,
+                            use_h4=h4,
+                            trades=s.trades,
+                            win_rate=s.win_rate,
+                            net_profit=s.net_profit,
+                            return_pct=s.return_pct,
+                            profit_factor=s.profit_factor,
+                            expectancy=s.expectancy,
+                            max_dd_pct=s.max_drawdown_pct,
+                            days_filled=s.trades + (1 if r.open_trade else 0),
+                            days_no_rvol=r.skipped_no_rvol,
+                        )
+                    )
+    return rows
+
+
+def format_sweep(rows: Sequence[SweepRow]) -> str:
+    if not rows:
+        return "No valid parameter combinations.\n"
+    head = (
+        f"{'OR':>3} {'Win':>4} {'RVOL':>5} {'4H':>3}  {'trades':>6} {'win%':>6} "
+        f"{'net P&L':>14} {'ret%':>7} {'PF':>6} {'expect':>12} {'maxDD%':>7} "
+        f"{'filled':>6} {'noRVOL':>6}"
+    )
+    best = max(rows, key=lambda r: r.net_profit)
+    out = [head, "-" * len(head)]
+    for r in rows:
+        pf = "  n/a" if r.profit_factor is None else f"{r.profit_factor:>6.2f}"
+        mark = " *" if r is best else "  "
+        out.append(
+            f"{r.or_minutes:>3} {r.entry_window:>4} {r.rvol_pct:>4.0f}% "
+            f"{('on' if r.use_h4 else 'off'):>3}  {r.trades:>6} {r.win_rate:>5.1f}% "
+            f"{r.net_profit:>14,.0f} {r.return_pct:>6.1f}% {pf} {r.expectancy:>12,.0f} "
+            f"{r.max_dd_pct:>6.1f}% {r.days_filled:>6} {r.days_no_rvol:>6}{mark}"
+        )
+    out += [
+        "",
+        f"  * best net P&L: OR {best.or_minutes}m, window {best.entry_window}m, "
+        f"RVOL {best.rvol_pct:.0f}%, 4H {'on' if best.use_h4 else 'off'}",
+        "",
+        "  Read the trade count before the P&L. A cell with three trades is noise,",
+        "  whatever its profit factor, and the best cell in any grid is the one most",
+        "  likely to be overfit. Look for a plateau of decent neighbours, not a peak.",
+    ]
+    return "\n".join(out) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +662,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--commission", type=float, default=0.03, help="%% per side")
     ap.add_argument("--slippage", type=int, default=2, help="ticks per side")
     ap.add_argument("--eod-exit", action="store_true", help="flat at the session close")
+    ap.add_argument("--max-or-atr", type=float, default=None,
+                    help="skip days whose opening range is wider than this x daily ATR")
+    ap.add_argument("--sweep", action="store_true", help="grid over the entry parameters")
+    ap.add_argument("--sweep-or", default="5", help="opening ranges to try, comma separated")
+    ap.add_argument("--sweep-window", default="10,15,30,60", help="entry windows to try")
+    ap.add_argument("--sweep-rvol", default="5,7,9,12", help="RVOL thresholds to try, %%")
+    ap.add_argument("--sweep-h4", default="both", choices=["on", "off", "both"])
     ap.add_argument("--out", help="write the signal-by-signal blotter to this CSV")
     ap.add_argument("--list", type=int, default=25, help="trades to print (0 = all)")
     a = ap.parse_args(argv)
@@ -565,11 +689,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         commission_pct=a.commission / 100.0,
         slippage_ticks=a.slippage,
         eod_exit=a.eod_exit,
+        max_or_atr=a.max_or_atr,
     )
-    result = run_backtest(candles, cfg, StrategyConfig(tick_size=a.tick))
+    scfg = StrategyConfig(tick_size=a.tick)
 
-    print(f"\nBars {len(candles):,}   sessions {result.sessions}   "
+    print(f"\nBars {len(candles):,}   sessions {len(session_bars(candles, cfg))}   "
           f"{candles[0].ts:%Y-%m-%d} -> {candles[-1].ts:%Y-%m-%d}")
+
+    if a.sweep:
+        ints = lambda t: [int(x) for x in t.split(",") if x.strip()]
+        floats = lambda t: [float(x) for x in t.split(",") if x.strip()]
+        h4 = {"on": [True], "off": [False], "both": [True, False]}[a.sweep_h4]
+        rows = run_sweep(candles, cfg, scfg, ints(a.sweep_or), ints(a.sweep_window),
+                         floats(a.sweep_rvol), h4)
+        print(f"Sweeping {len(rows)} combinations\n")
+        print(format_sweep(rows))
+        return 0
+
+    result = run_backtest(candles, cfg, scfg)
+
     print(f"OR {cfg.or_minutes}m  window {cfg.entry_window_minutes}m  "
           f"RVOL {cfg.rvol_threshold:.1%}  4H filter {'on' if cfg.use_h4 else 'off'}\n")
     print(format_blotter(result, None if a.list == 0 else a.list))

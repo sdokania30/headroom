@@ -8,7 +8,7 @@ Two deliverables from one ruleset:
 | `strategy.py` | Reference implementation of the same logic in Python — the executable spec the Pine was derived from. |
 | `backtest.py` | **Walk-forward backtester + CLI.** Trade blotter, P&L, performance summary, signal funnel. |
 | `test_strategy.py` | 46 unit tests of the reference implementation. |
-| `test_backtest.py` | 22 tests of the backtest engine. |
+| `test_backtest.py` | 32 tests of the backtest engine, the sweep and the filters. |
 | `test_pine_parity.py` | 11 tests asserting three implementations of the 4H filter agree. |
 | `demo.py` | Synthetic end-to-end walkthrough. |
 
@@ -82,6 +82,7 @@ TradingView's own Strategy Tester panel gives the full report; these read the sa
 | `rvolMinutes` | `15` | How long the RVOL gate may latch. |
 | `rvolPct` | `9.0` | Share of 20-day ADV. |
 | `useH4` | `on` | Toggle the 4H filter to measure what it is worth. |
+| `maxOrAtr` | `0` (off) | Skip days whose opening range is wider than N × daily ATR — the gap-up guard. |
 | `chandTF` | `D` | **See below.** Empty string = chart timeframe. |
 | `eodExit` | `off` | This is a swing strategy. |
 
@@ -107,15 +108,35 @@ python3 backtest.py --csv bars_5m.csv --out trades.csv --window 30 --no-h4
 
 **Input CSV**: header row, then `timestamp,open,high,low,close,volume`. Timestamps ISO-8601 (`2026-01-05 09:15:00`) or epoch seconds, in exchange local time, 5-minute bars.
 
-**Flags**: `--or` `--window` `--rvol-window` `--rvol` `--no-h4` `--capital` `--tick` `--commission` `--slippage` `--eod-exit` `--out` `--list`.
+**Flags**: `--or` `--window` `--rvol-window` `--rvol` `--no-h4` `--max-or-atr` `--capital` `--tick` `--commission` `--slippage` `--eod-exit` `--out` `--list`.
 
 **Output** — three blocks:
 
 1. **Blotter**: every trade as BUY time/price → SELL time/price, quantity, net P&L in currency and %, bars held, worst adverse excursion, and the exit reason.
 2. **Performance**: net profit, return on capital, gross profit/loss, costs paid, profit factor, win rate, avg win / avg loss, expectancy, best/worst, max drawdown.
-3. **Signal funnel**: sessions tested → days with no RVOL → days blocked by the 4H filter → days armed but never filled → days filled. This is the block to read first. It tells you *where* the strategy is losing its opportunities, which matters more than the P&L when you are tuning.
+3. **Signal funnel**: sessions tested → days with no RVOL → days blocked by the 4H filter → days with too wide an open → days armed but never filled → days filled. This is the block to read first. It tells you *where* the strategy is losing its opportunities, which matters more than the P&L when you are tuning.
 
 `--out` writes two rows per trade (BUY and SELL) so the file drops straight into a spreadsheet.
+
+### Parameter sweep
+
+```bash
+python3 backtest.py --csv bars_5m.csv --sweep
+python3 backtest.py --csv bars_5m.csv --sweep --sweep-window 10,15,30,60 --sweep-rvol 5,7,9,12 --sweep-h4 both
+```
+
+One row per combination of opening range × entry window × RVOL threshold × 4H filter, with trades, win rate, net P&L, return, profit factor, expectancy, max drawdown, days filled and days rejected by RVOL. Combinations where the entry window is not longer than the opening range can never fill and are skipped rather than reported as empty rows.
+
+Two things to hold onto when reading the grid:
+
+- **Trade count before P&L.** A cell with three trades is noise however good its profit factor looks.
+- **Plateau, not peak.** The single best cell in any grid is the one most likely to be overfit. What you want is a region where the neighbours are also decent — that is a parameter you can trust out of sample.
+
+The funnel column is often the most informative part. On synthetic data, widening the window from 10 to 30 minutes drops "days with no RVOL" from 124/160 to 7/160 — the threshold is not really measuring unusual volume at 10 minutes so much as measuring how much of the day has elapsed.
+
+### The gap-up guard
+
+`--max-or-atr` (Pine: `maxOrAtr`) skips a day when `orHigh − orLow` exceeds N × daily ATR. On a gap-up the first 5-minute bar can be enormous, which puts the buy-stop above an already-extended high and the 1.5×ATR initial stop uncomfortably far below it. Off by default; try `1.0`–`2.0` and compare.
 
 ### What the engine models
 
@@ -194,7 +215,7 @@ The source rules were underspecified in eight places. Each is closed with an exp
 3. **Position sizing is 100% of equity per trade.** Change `default_qty_type` / `default_qty_value` before this means anything about returns.
 4. **Commission 0.03% and 2-tick slippage** are placeholders. Set them to your actual costs — an opening-range strategy is slippage-sensitive and these assumptions move the equity curve materially.
 5. **The window is still tight.** Two fill attempts per day. Backtest `entryWindow` at 15 / 30 / 60 before concluding the edge is absent.
-6. **Gap-up days are not handled specially.** If the stock gaps and bar 1 is a wide range, the buy-stop sits above an already-extended high and the initial stop is far away. Consider a maximum opening-range width filter (`orHigh - orLow` as a multiple of ATR).
+6. **The gap-up guard is off by default.** `maxOrAtr` / `--max-or-atr` exists and is tested, but no value is chosen for you — it needs real data to calibrate.
 7. **The 4H bar boundary on NSE is awkward.** A 6h15m session does not divide into 4H bars cleanly. Verify what TradingView actually builds for your symbol before trusting `h4TF = 240`.
 
 ---
@@ -202,6 +223,15 @@ The source rules were underspecified in eight places. Each is closed with an exp
 ## 6. Python reference usage
 
 ```python
+# Parameter sweep
+from backtest import BacktestConfig, format_sweep, load_csv, run_sweep
+from strategy import StrategyConfig
+
+rows = run_sweep(load_csv("bars_5m.csv"), BacktestConfig(), StrategyConfig(),
+                 or_list=[5], window_list=[10, 15, 30, 60],
+                 rvol_list=[5, 7, 9, 12], h4_list=[True, False])
+print(format_sweep(rows))
+
 # Programmatic backtest
 from backtest import BacktestConfig, load_csv, run_backtest, summarise, format_blotter
 

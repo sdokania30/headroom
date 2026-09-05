@@ -55,6 +55,11 @@ orMinutes   = input.int(5, "Opening range (minutes)", minval = 1, maxval = 240, 
 entryWindow = input.int(15, "Entry window from the open (minutes)", minval = 2, maxval = 375, group = gSess,
      tooltip = "The order may only be WORKING inside this window. Must be longer than the opening range. On a 5-min chart, 15 leaves two fillable bars.")
 
+gFilt = "Opening-range quality filter"
+maxOrAtr = input.float(0.0, "Max opening-range width (x daily ATR, 0 = off)", minval = 0.0, step = 0.1,
+     group = gFilt,
+     tooltip = "On a gap-up the first bar can be enormous, which puts the buy-stop above an already-extended high and the initial stop far below it. Set to e.g. 1.0 to skip those days.")
+
 gRvol = "RVOL gate"
 advLen     = input.int(20, "ADV lookback (days)", minval = 1, group = gRvol)
 rvolPct    = input.float(9.0, "Cumulative volume as % of ADV", minval = 0.1, step = 0.5, group = gRvol,
@@ -243,11 +248,20 @@ if newH4 and not na(h4Close[1]) and not na(h4Ema[1]) and not na(h4Atr[1]) and h4
 h4Gate = not useH4 or h4Ready
 
 // ----------------------------------------------------------------------------
+// Daily ATR and the Chandelier line (used by the OR-width filter and the exit)
+// ----------------------------------------------------------------------------
+[chandRaw, atrExit] = request.security(syminfo.tickerid, chandTF == "" ? timeframe.period : chandTF,
+     [ta.highest(high, chandLen) - chandMult * ta.atr(chandLen), ta.atr(chandLen)],
+     lookahead = barmerge.lookahead_off)
+
+// ----------------------------------------------------------------------------
 // Entry: buy-stop 1 tick above the opening-range high
 // ----------------------------------------------------------------------------
-badConfig = entryWindow <= orMinutes
-entryStop = na(orHigh) ? na : orHigh + syminfo.mintick
-canWork   = orderMayWork and not badConfig and rvolOK and h4Gate and
+badConfig  = entryWindow <= orMinutes
+orWidth    = na(orHigh) or na(orLow) ? na : orHigh - orLow
+orWidthOK  = maxOrAtr <= 0 or na(atrExit) or na(orWidth) or orWidth <= maxOrAtr * atrExit
+entryStop  = na(orHigh) ? na : orHigh + syminfo.mintick
+canWork    = orderMayWork and not badConfig and rvolOK and h4Gate and orWidthOK and
              strategy.position_size == 0 and not tradedToday and not na(entryStop)
 
 if canWork
@@ -262,10 +276,6 @@ if justEntered
 // ----------------------------------------------------------------------------
 // Exit: Chandelier close-through, plus an optional ATR initial stop
 // ----------------------------------------------------------------------------
-[chandRaw, atrExit] = request.security(syminfo.tickerid, chandTF == "" ? timeframe.period : chandTF,
-     [ta.highest(high, chandLen) - chandMult * ta.atr(chandLen), ta.atr(chandLen)],
-     lookahead = barmerge.lookahead_off)
-
 var float trail    = na
 var float initStop = na
 
@@ -304,7 +314,7 @@ bgcolor(inEntryWin and rvolOK ? color.new(color.green, 82) : na, title = "RVOL b
 
 plotshape(justEntered, "Entry", shape.triangleup, location.belowbar, color.new(color.teal, 0), size = size.tiny)
 
-var table info = table.new(position.top_right, 2, 6, border_width = 1)
+var table info = table.new(position.top_right, 2, 7, border_width = 1)
 if showTable and barstate.islast
     table.cell(info, 0, 0, "RVOL (session / ADV)", text_halign = text.align_left, text_size = size.small)
     table.cell(info, 1, 0, na(rvolShare) ? "n/a" : str.tostring(rvolShare * 100, "#.##") + "%",
@@ -318,8 +328,12 @@ if showTable and barstate.islast
          bgcolor = h4Gate ? color.new(color.green, 70) : color.new(color.red, 80))
     table.cell(info, 0, 4, "4H trigger", text_halign = text.align_left, text_size = size.small)
     table.cell(info, 1, 4, na(h4Trigger) ? "-" : str.tostring(h4Trigger, format.mintick), text_size = size.small)
-    table.cell(info, 0, 5, "Entry window (" + str.tostring(entryWindow) + "m)", text_halign = text.align_left, text_size = size.small)
-    table.cell(info, 1, 5, badConfig ? "BAD CONFIG" : inEntryWin ? "open" : "closed", text_size = size.small,
+    table.cell(info, 0, 5, "OR width", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 5, na(orWidth) ? "-" : str.tostring(orWidth, format.mintick) +
+         (maxOrAtr > 0 ? (orWidthOK ? "  ok" : "  too wide") : ""), text_size = size.small,
+         bgcolor = maxOrAtr > 0 and not orWidthOK ? color.new(color.red, 70) : na)
+    table.cell(info, 0, 6, "Entry window (" + str.tostring(entryWindow) + "m)", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 6, badConfig ? "BAD CONFIG" : inEntryWin ? "open" : "closed", text_size = size.small,
          bgcolor = badConfig ? color.new(color.red, 50) : na)
 
 // ----------------------------------------------------------------------------

@@ -13,9 +13,11 @@ from backtest import (
     demo_data,
     format_blotter,
     format_summary,
+    format_sweep,
     htf_bars,
     load_csv,
     run_backtest,
+    run_sweep,
     session_bars,
     summarise,
     write_trades_csv,
@@ -221,3 +223,83 @@ class SummaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrWidthFilterTests(unittest.TestCase):
+    """Opening-range width filter: skip days whose first bar is a gap-driven monster."""
+
+    def build(self, or_range: float, max_or_atr):
+        history, day = quiet_history(25)
+        _, nxt = quiet_history(26)
+        wide = [
+            Candle(day, 100.0, 100.0 + or_range, 99.5, 100.5, 8000.0),
+            Candle(day + timedelta(minutes=5), 100.5, 100.0 + or_range + 6, 100.4,
+                   100.0 + or_range + 5, 1000.0),
+        ]
+        price = 100.0 + or_range + 5
+        for b in range(2, 75):
+            price += 0.22
+            wide.append(Candle(day + timedelta(minutes=5 * b), price, price + 0.3, price - 0.2,
+                               price, 1000.0))
+        cfg = BacktestConfig(use_h4=False, tick_size=0.05, max_or_atr=max_or_atr)
+        return run_backtest(history + wide + flat_session(nxt, price=110.0), cfg, SCFG)
+
+    def test_a_narrow_open_still_trades_with_the_filter_on(self):
+        # Quiet history gives a daily ATR near 1.0; a 1.0-wide range passes at 2x.
+        r = self.build(or_range=1.0, max_or_atr=2.0)
+        self.assertEqual(len(r.trades), 1)
+        self.assertEqual(r.skipped_wide_or, 0)
+
+    def test_a_wide_open_is_skipped(self):
+        r = self.build(or_range=12.0, max_or_atr=2.0)
+        self.assertEqual(r.trades, [])
+        self.assertEqual(r.skipped_wide_or, 1)
+
+    def test_the_same_wide_open_trades_with_the_filter_off(self):
+        r = self.build(or_range=12.0, max_or_atr=None)
+        self.assertEqual(len(r.trades), 1)
+        self.assertEqual(r.skipped_wide_or, 0)
+
+    def test_the_filter_appears_in_the_summary(self):
+        self.assertIn("wide open", format_summary(self.build(12.0, 2.0)))
+
+
+class SweepTests(unittest.TestCase):
+    CANDLES = demo_data(sessions=60, seed=11)
+
+    def sweep(self, **kw):
+        params = dict(or_list=[5], window_list=[15, 30], rvol_list=[9.0], h4_list=[True, False])
+        params.update(kw)
+        return run_sweep(self.CANDLES, BacktestConfig(), StrategyConfig(), **params)
+
+    def test_the_grid_covers_every_valid_combination(self):
+        self.assertEqual(len(self.sweep()), 4)
+
+    def test_combinations_that_can_never_fill_are_skipped(self):
+        rows = self.sweep(or_list=[5], window_list=[5, 15])
+        self.assertTrue(all(r.entry_window > r.or_minutes for r in rows))
+        self.assertEqual(len(rows), 2)
+
+    def test_each_row_matches_a_direct_run(self):
+        row = self.sweep(window_list=[30], h4_list=[False])[0]
+        direct = summarise(run_backtest(
+            self.CANDLES,
+            BacktestConfig(entry_window_minutes=30, rvol_window_minutes=30, use_h4=False),
+            StrategyConfig(),
+        ))
+        self.assertEqual(row.trades, direct.trades)
+        self.assertAlmostEqual(row.net_profit, direct.net_profit, places=6)
+
+    def test_a_looser_threshold_never_sees_fewer_rvol_days(self):
+        rows = {r.rvol_pct: r for r in self.sweep(rvol_list=[5.0, 15.0], h4_list=[False],
+                                                  window_list=[30])}
+        self.assertLessEqual(rows[5.0].days_no_rvol, rows[15.0].days_no_rvol)
+
+    def test_the_report_renders_and_marks_a_best_row(self):
+        text = format_sweep(self.sweep())
+        self.assertIn("net P&L", text)
+        self.assertIn("best net P&L", text)
+        self.assertIn("*", text)
+
+    def test_an_empty_grid_renders_safely(self):
+        self.assertIn("No valid parameter combinations", format_sweep([]))
