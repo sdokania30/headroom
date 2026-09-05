@@ -17,6 +17,7 @@ import unittest
 
 from strategy import (
     Candle,
+    H4PullbackFilter,
     SetupStatus,
     StrategyConfig,
     atr,
@@ -103,6 +104,21 @@ def pine_state_machine(
     return fires
 
 
+def filter_fires(candles, cfg):
+    """Breakouts fired by H4PullbackFilter -- the class the backtester and the
+    Pine script both express."""
+    ema_vals = ema([c.close for c in candles], cfg.ema_period)
+    atr_vals = atr(candles, cfg.atr_period)
+    flt = H4PullbackFilter(cfg)
+    out = []
+    for i, c in enumerate(candles):
+        level = flt.trigger
+        flt.update(c, ema_vals[i], atr_vals[i])
+        if flt.fired:
+            out.append((i, level))
+    return out
+
+
 def reference_fires(candles, cfg):
     return [
         (s.resolved_at_index, s.entry_price)
@@ -144,14 +160,19 @@ PINE_KW = dict(
 
 class PineParityTests(unittest.TestCase):
     def assert_parity(self, candles, msg=""):
-        self.assertEqual(pine_state_machine(candles, **PINE_KW), reference_fires(candles, CFG), msg)
+        """Three implementations, one answer: the .pine transliteration, the
+        H4PullbackFilter class used in production, and the batch scan_4h."""
+        pine = pine_state_machine(candles, **PINE_KW)
+        self.assertEqual(pine, reference_fires(candles, CFG), "pine vs scan_4h " + msg)
+        self.assertEqual(pine, filter_fires(candles, CFG), "pine vs H4PullbackFilter " + msg)
 
     def test_parity_on_random_walks(self):
         fired_total = 0
         for seed in range(60):
             candles = random_walk(400, seed)
             pine = pine_state_machine(candles, **PINE_KW)
-            self.assertEqual(pine, reference_fires(candles, CFG), f"seed {seed}")
+            self.assertEqual(pine, reference_fires(candles, CFG), f"scan_4h seed {seed}")
+            self.assertEqual(pine, filter_fires(candles, CFG), f"filter seed {seed}")
             fired_total += len(pine)
         # Guard against a vacuous pass where neither implementation ever fires.
         self.assertGreater(fired_total, 20, "random walks produced too few breakouts to be meaningful")

@@ -358,6 +358,118 @@ def _arm(setup: Setup, candles: Sequence[Candle], cfg: StrategyConfig) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Incremental form of the 4H filter (what the backtester and the Pine both use)
+# ---------------------------------------------------------------------------
+
+class H4PullbackFilter:
+    """Bar-at-a-time 4H long-setup state machine.
+
+    ``scan_4h`` is the batch form and returns rich ``Setup`` objects; this is the
+    same rules expressed as a stream, which is what a walk-forward backtest and
+    the Pine script need. ``test_pine_parity`` asserts the two agree, and that
+    both agree with a line-for-line transliteration of the .pine file.
+
+    After each ``update`` call, ``ready`` answers: is a long setup armed, or has
+    one broken out within the last ``trigger_valid_bars`` bars?
+    """
+
+    def __init__(self, config: Optional[StrategyConfig] = None) -> None:
+        self.cfg = config or StrategyConfig()
+        self.run_side = 0
+        self.run_len = 0
+        self.run_sep = 0.0
+        self.pb_count = 0
+        self.pb_first_high: Optional[float] = None
+        self.trigger: Optional[float] = None
+        self.since_arm = 0
+        self.since_trig: Optional[int] = None
+        self.ready = False
+        self.fired = False
+
+    def _reset(self) -> None:
+        self.pb_count = 0
+        self.pb_first_high = None
+        self.trigger = None
+        self.since_arm = 0
+
+    def update(self, candle: Candle, ema_value: Optional[float], atr_value: Optional[float]) -> bool:
+        cfg = self.cfg
+        self.fired = False
+        if ema_value is None or atr_value is None or atr_value <= 0:
+            return self.ready
+
+        o, h, c, e, a = candle.open, candle.high, candle.close, ema_value, atr_value
+        side = 1 if c > e else (-1 if c < e else 0)
+        prev_side = self.run_side
+        if side != 0 and side == self.run_side:
+            self.run_len += 1
+        else:
+            self.run_side = side
+            self.run_len = 1 if side != 0 else 0
+            self.run_sep = 0.0
+        if side != 0:
+            self.run_sep = max(self.run_sep, abs(c - e) / a)
+        flipped_down = side == -1 and prev_side == 1
+
+        kill = False
+        if self.trigger is not None and h >= self.trigger:
+            self.fired = True
+            kill = True
+        elif flipped_down:
+            kill = True
+        elif c < o:
+            if max(o, c) < e:
+                kill = True                       # body through the 50 EMA
+            else:
+                if self.pb_count == 0:
+                    if (
+                        self.run_side == 1
+                        and self.run_len >= cfg.trend_confirm_bars
+                        and self.run_sep >= cfg.min_separation_atr
+                    ):
+                        self.pb_count = 1
+                        self.pb_first_high = h
+                else:
+                    self.pb_count += 1
+                if self.pb_count > cfg.max_pullback_bars:
+                    kill = True
+                elif self.pb_count >= cfg.min_pullback_bars and self.pb_first_high is not None:
+                    self.trigger = self.pb_first_high + cfg.tick_size
+                    self.since_arm = 0
+        else:
+            if self.pb_count > 0 and self.trigger is None:
+                self.pb_count = 0
+                self.pb_first_high = None
+            elif self.trigger is not None:
+                self.since_arm += 1
+                if self.since_arm > cfg.trigger_valid_bars:
+                    kill = True
+
+        if kill:
+            self._reset()
+        if self.fired:
+            self.since_trig = 0
+        elif self.since_trig is not None:
+            self.since_trig += 1
+
+        self.ready = self.trigger is not None or (
+            self.since_trig is not None and self.since_trig <= cfg.trigger_valid_bars
+        )
+        return self.ready
+
+
+def h4_ready_series(
+    candles: Sequence[Candle], config: Optional[StrategyConfig] = None
+) -> list[bool]:
+    """``ready`` state after each 4H bar closes -- the series the backtest indexes."""
+    cfg = config or StrategyConfig()
+    ema_vals = ema([c.close for c in candles], cfg.ema_period)
+    atr_vals = atr(candles, cfg.atr_period)
+    flt = H4PullbackFilter(cfg)
+    return [flt.update(c, ema_vals[i], atr_vals[i]) for i, c in enumerate(candles)]
+
+
+# ---------------------------------------------------------------------------
 # Stage 4: intraday RVOL execution gate
 # ---------------------------------------------------------------------------
 

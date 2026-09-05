@@ -40,7 +40,9 @@ strategy("RVOL ORB Swing (Long)", shorttitle="RVOL-ORB Long", overlay=true,
      commission_value       = 0.03,
      slippage               = 2,
      calc_on_every_tick     = false,
-     process_orders_on_close = false)
+     process_orders_on_close = false,
+     max_labels_count       = 500,
+     max_lines_count        = 500)
 
 // ----------------------------------------------------------------------------
 // Inputs
@@ -82,6 +84,14 @@ useInitStop = input.bool(true, "Initial ATR stop", group = gExit)
 initATR     = input.float(1.5, "Initial stop (x ATR)", minval = 0.1, step = 0.1, group = gExit)
 eodExit     = input.bool(false, "Force flat at the session close", group = gExit,
      tooltip = "Off by default. This is a swing strategy; positions are meant to be held overnight.")
+
+gTrade = "Backtest visuals"
+showSignals = input.bool(true, "BUY / SELL labels", group = gTrade)
+showPnl     = input.bool(true, "Show profit booked on each exit", group = gTrade)
+showConnect = input.bool(true, "Connect entry to exit", group = gTrade)
+showStats   = input.bool(true, "Performance summary table", group = gTrade)
+showLog     = input.bool(true, "Recent trades log", group = gTrade)
+logRows     = input.int(10, "Trades to list", minval = 1, maxval = 30, group = gTrade)
 
 gViz = "Display"
 showEma    = input.bool(true, "Plot the 4H 50 EMA", group = gViz)
@@ -313,8 +323,113 @@ if showTable and barstate.islast
          bgcolor = badConfig ? color.new(color.red, 50) : na)
 
 // ----------------------------------------------------------------------------
+// Backtest visuals: BUY / SELL markers, profit booked, and the summary tables
+// ----------------------------------------------------------------------------
+if showSignals and justEntered
+    label.new(bar_index, low, "BUY\n" + str.tostring(strategy.position_avg_price, format.mintick),
+         xloc      = xloc.bar_index,
+         yloc      = yloc.belowbar,
+         style     = label.style_label_up,
+         color     = color.new(color.teal, 10),
+         textcolor = color.white,
+         size      = size.small)
+
+tradeClosed = strategy.closedtrades > nz(strategy.closedtrades[1])
+if tradeClosed
+    int    ti   = strategy.closedtrades - 1
+    float  pnl  = strategy.closedtrades.profit(ti)
+    float  ep   = strategy.closedtrades.entry_price(ti)
+    float  xp   = strategy.closedtrades.exit_price(ti)
+    int    ebar = strategy.closedtrades.entry_bar_index(ti)
+    int    xbar = strategy.closedtrades.exit_bar_index(ti)
+    string rsn  = strategy.closedtrades.exit_id(ti)
+    float  pct  = ep != 0 ? (xp - ep) / ep * 100.0 : 0.0
+    bool   win  = pnl >= 0
+
+    if showSignals
+        string txt = "SELL " + str.tostring(xp, format.mintick)
+        if showPnl
+            txt := txt + "\n" + (win ? "+" : "") + str.tostring(pnl, "#.##") +
+                 "  (" + (win ? "+" : "") + str.tostring(pct, "#.##") + "%)"
+            txt := txt + "\n" + (na(rsn) ? "exit" : rsn)
+        label.new(xbar, high, txt,
+             xloc      = xloc.bar_index,
+             yloc      = yloc.abovebar,
+             style     = label.style_label_down,
+             color     = win ? color.new(color.green, 10) : color.new(color.red, 10),
+             textcolor = color.white,
+             size      = size.small)
+
+    if showConnect
+        line.new(ebar, ep, xbar, xp,
+             xloc  = xloc.bar_index,
+             color = win ? color.new(color.green, 30) : color.new(color.red, 30),
+             width = 1,
+             style = line.style_dashed)
+
+f_money(x) => (x >= 0 ? "" : "-") + str.tostring(math.abs(x), "#,###.##")
+
+var table stats = table.new(position.bottom_right, 2, 9, border_width = 1)
+if showStats and barstate.islast
+    int   tot  = strategy.closedtrades
+    int   wins = strategy.wintrades
+    int   loss = strategy.losstrades
+    float wr   = tot > 0 ? wins / tot * 100.0 : 0.0
+    float pf   = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    float avgW = wins > 0 ? strategy.grossprofit / wins : 0.0
+    float avgL = loss > 0 ? strategy.grossloss / loss : 0.0
+    float ret  = strategy.initial_capital > 0 ? strategy.netprofit / strategy.initial_capital * 100.0 : 0.0
+
+    table.cell(stats, 0, 0, "PERFORMANCE", text_halign = text.align_left, text_size = size.small,
+         bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(stats, 1, 0, "", bgcolor = color.new(color.gray, 60))
+    table.cell(stats, 0, 1, "Net profit", text_halign = text.align_left, text_size = size.small)
+    table.cell(stats, 1, 1, f_money(strategy.netprofit), text_size = size.small,
+         bgcolor = strategy.netprofit >= 0 ? color.new(color.green, 70) : color.new(color.red, 70))
+    table.cell(stats, 0, 2, "Return on capital", text_halign = text.align_left, text_size = size.small)
+    table.cell(stats, 1, 2, str.tostring(ret, "#.##") + "%", text_size = size.small)
+    table.cell(stats, 0, 3, "Closed trades", text_halign = text.align_left, text_size = size.small)
+    table.cell(stats, 1, 3, str.tostring(tot), text_size = size.small)
+    table.cell(stats, 0, 4, "Win rate", text_halign = text.align_left, text_size = size.small)
+    table.cell(stats, 1, 4, str.tostring(wr, "#.#") + "%  (" + str.tostring(wins) + "W / " + str.tostring(loss) + "L)",
+         text_size = size.small)
+    table.cell(stats, 0, 5, "Profit factor", text_halign = text.align_left, text_size = size.small)
+    table.cell(stats, 1, 5, na(pf) ? "n/a" : str.tostring(pf, "#.##"), text_size = size.small)
+    table.cell(stats, 0, 6, "Avg win / avg loss", text_halign = text.align_left, text_size = size.small)
+    table.cell(stats, 1, 6, f_money(avgW) + " / " + f_money(avgL), text_size = size.small)
+    table.cell(stats, 0, 7, "Max drawdown", text_halign = text.align_left, text_size = size.small)
+    table.cell(stats, 1, 7, f_money(strategy.max_drawdown), text_size = size.small)
+    table.cell(stats, 0, 8, "Open P&L", text_halign = text.align_left, text_size = size.small)
+    table.cell(stats, 1, 8, f_money(strategy.openprofit), text_size = size.small,
+         bgcolor = strategy.openprofit >= 0 ? color.new(color.green, 80) : color.new(color.red, 80))
+
+var table blotter = table.new(position.bottom_left, 5, logRows + 1, border_width = 1)
+if showLog and barstate.islast and strategy.closedtrades > 0
+    table.cell(blotter, 0, 0, "#",     text_size = size.tiny, bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(blotter, 1, 0, "Entry", text_size = size.tiny, bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(blotter, 2, 0, "Exit",  text_size = size.tiny, bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(blotter, 3, 0, "P&L",   text_size = size.tiny, bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(blotter, 4, 0, "Why",   text_size = size.tiny, bgcolor = color.new(color.gray, 60), text_color = color.white)
+    int rows = math.min(logRows, strategy.closedtrades)
+    for r = 0 to rows - 1
+        int   ti  = strategy.closedtrades - 1 - r
+        float pnl = strategy.closedtrades.profit(ti)
+        float ep  = strategy.closedtrades.entry_price(ti)
+        float xp  = strategy.closedtrades.exit_price(ti)
+        float pct = ep != 0 ? (xp - ep) / ep * 100.0 : 0.0
+        color bg  = pnl >= 0 ? color.new(color.green, 80) : color.new(color.red, 80)
+        table.cell(blotter, 0, r + 1, str.tostring(ti + 1), text_size = size.tiny, bgcolor = bg)
+        table.cell(blotter, 1, r + 1, str.tostring(ep, format.mintick), text_size = size.tiny, bgcolor = bg)
+        table.cell(blotter, 2, r + 1, str.tostring(xp, format.mintick), text_size = size.tiny, bgcolor = bg)
+        table.cell(blotter, 3, r + 1, f_money(pnl) + " (" + str.tostring(pct, "#.#") + "%)",
+             text_size = size.tiny, bgcolor = bg)
+        table.cell(blotter, 4, r + 1, str.tostring(strategy.closedtrades.exit_id(ti)), text_size = size.tiny, bgcolor = bg)
+
+// ----------------------------------------------------------------------------
 // Alerts
 // ----------------------------------------------------------------------------
 alertcondition(canWork and not canWork[1], "Order working",
      "RVOL gate passed; buy-stop working above the opening-range high.")
 alertcondition(justEntered, "Long entry filled", "Long filled on the opening-range breakout.")
+alertcondition(strategy.closedtrades > nz(strategy.closedtrades[1]), "Position closed",
+     "Long closed. Check the blotter for the booked P&L.")

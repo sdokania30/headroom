@@ -6,14 +6,16 @@ Two deliverables from one ruleset:
 |---|---|
 | `pine/rvol_hod_swing_long.pine` | **The tradeable strategy.** Pine Script v6, long only, for a 5-minute chart. |
 | `strategy.py` | Reference implementation of the same logic in Python — the executable spec the Pine was derived from. |
+| `backtest.py` | **Walk-forward backtester + CLI.** Trade blotter, P&L, performance summary, signal funnel. |
 | `test_strategy.py` | 46 unit tests of the reference implementation. |
-| `test_pine_parity.py` | 11 tests asserting the Pine logic and the Python reference behave identically. |
+| `test_backtest.py` | 22 tests of the backtest engine. |
+| `test_pine_parity.py` | 11 tests asserting three implementations of the 4H filter agree. |
 | `demo.py` | Synthetic end-to-end walkthrough. |
 
 ```bash
 cd strategies/pullback_50ema
-python3 -m unittest test_strategy test_pine_parity -v
-python3 demo.py
+python3 -m unittest test_strategy test_pine_parity test_backtest -v
+python3 backtest.py --demo
 ```
 
 ---
@@ -53,6 +55,18 @@ An order can never fill on the bar that placed it — it is a resting stop, and 
 
 `entryWindow` must be greater than `orMinutes` or nothing can ever fill; the status table flags `BAD CONFIG` if you set it that way.
 
+### Backtest signals on the chart
+
+Turn on **Backtest visuals** in the settings (all on by default):
+
+- **BUY label** below the entry bar with the fill price.
+- **SELL label** above the exit bar with the exit price, the **profit booked** in currency and %, and the exit reason (`Chandelier`, `Init stop`, `EOD`).
+- **Dashed connector** from entry to exit, green for a win, red for a loss.
+- **Performance table** (bottom right): net profit, return on capital, closed trades, win rate, profit factor, avg win / avg loss, max drawdown, open P&L.
+- **Trade blotter** (bottom left): the last N closed trades — entry, exit, P&L, and why it closed.
+
+TradingView's own Strategy Tester panel gives the full report; these read the same `strategy.closedtrades.*` values and put them on the chart so you can eyeball each signal against the bars that produced it.
+
 ### Exit
 
 - **Chandelier Exit**, `HH(22) − 3 × ATR(22)`, exit on an intraday **close** below the line. Ratcheted by default.
@@ -81,7 +95,46 @@ Every higher-timeframe read uses `barmerge.lookahead_off`. The 4H state machine 
 
 ---
 
-## 2. Rule → code mapping
+## 2. Backtesting offline
+
+`backtest.py` runs the same rules bar for bar without TradingView, so you can sweep parameters, diff configurations and get a signal-by-signal CSV.
+
+```bash
+python3 backtest.py --demo                      # synthetic data, no input needed
+python3 backtest.py --csv bars_5m.csv           # your own 5-minute OHLCV
+python3 backtest.py --csv bars_5m.csv --out trades.csv --window 30 --no-h4
+```
+
+**Input CSV**: header row, then `timestamp,open,high,low,close,volume`. Timestamps ISO-8601 (`2026-01-05 09:15:00`) or epoch seconds, in exchange local time, 5-minute bars.
+
+**Flags**: `--or` `--window` `--rvol-window` `--rvol` `--no-h4` `--capital` `--tick` `--commission` `--slippage` `--eod-exit` `--out` `--list`.
+
+**Output** — three blocks:
+
+1. **Blotter**: every trade as BUY time/price → SELL time/price, quantity, net P&L in currency and %, bars held, worst adverse excursion, and the exit reason.
+2. **Performance**: net profit, return on capital, gross profit/loss, costs paid, profit factor, win rate, avg win / avg loss, expectancy, best/worst, max drawdown.
+3. **Signal funnel**: sessions tested → days with no RVOL → days blocked by the 4H filter → days armed but never filled → days filled. This is the block to read first. It tells you *where* the strategy is losing its opportunities, which matters more than the P&L when you are tuning.
+
+`--out` writes two rows per trade (BUY and SELL) so the file drops straight into a spreadsheet.
+
+### What the engine models
+
+| | |
+|---|---|
+| Fills | Resting buy-stop, filled at the level or the bar open if it gapped through — whichever is worse |
+| Slippage | 2 ticks per side (`--slippage`) |
+| Commission | 0.03% per side (`--commission`) |
+| Sizing | Whole shares, full equity, compounding |
+| Position carry | Swings are held across sessions; a new entry cannot open while one is live |
+| Chandelier | Daily `HH(22) − 3×ATR(22)` from completed sessions plus today's running high, tested on every 5-min close |
+| 4H filter | State advances only on closed 4H bars, anchored to the session open |
+| ADV | Trailing 20 completed sessions, never including today |
+
+Nothing reads a value that was not available at that moment. The one place it differs from Pine is intrabar sequencing: Pine's broker emulator makes its own assumption about whether the high or the low came first, so a bar that touches both the entry stop and the initial stop may be resolved differently. Expect the two to agree closely but not exactly.
+
+---
+
+## 3. Rule → code mapping
 
 | # | Source rule | Formalisation | Config knob |
 |---|---|---|---|
@@ -117,7 +170,7 @@ Every higher-timeframe read uses `barmerge.lookahead_off`. The 4H state machine 
 
 ---
 
-## 3. Resolved ambiguities
+## 4. Resolved ambiguities
 
 The source rules were underspecified in eight places. Each is closed with an explicit, overridable choice.
 
@@ -134,10 +187,10 @@ The source rules were underspecified in eight places. Each is closed with an exp
 
 ---
 
-## 4. What is still open
+## 5. What is still open
 
 1. **Not compiled on TradingView.** The Pine has never been through the TV compiler — no TV access from this environment. The *logic* is verified: `test_pine_parity.py` transliterates the Pine state machine line-for-line and asserts it fires identical breakouts to the tested Python reference across 60 random walks of 400 bars (579 matching breakouts) plus six hand-built edge cases, and does the same for the intraday entry across six window configurations and 720 synthetic sessions (88 matching fills). Syntax is the remaining risk, and it is a paste-and-see.
-2. **Nothing is backtested.** Every number is a default, not a fitted parameter. No walk-forward, no parameter sweep, no out-of-sample split.
+2. **Nothing is backtested on real data.** `backtest.py --demo` runs on a synthetic random walk — the machinery works, the numbers are noise. Point it at real bars before drawing any conclusion. No parameter sweep, no out-of-sample split, no multi-symbol test.
 3. **Position sizing is 100% of equity per trade.** Change `default_qty_type` / `default_qty_value` before this means anything about returns.
 4. **Commission 0.03% and 2-tick slippage** are placeholders. Set them to your actual costs — an opening-range strategy is slippage-sensitive and these assumptions move the equity curve materially.
 5. **The window is still tight.** Two fill attempts per day. Backtest `entryWindow` at 15 / 30 / 60 before concluding the edge is absent.
@@ -146,9 +199,17 @@ The source rules were underspecified in eight places. Each is closed with an exp
 
 ---
 
-## 5. Python reference usage
+## 6. Python reference usage
 
 ```python
+# Programmatic backtest
+from backtest import BacktestConfig, load_csv, run_backtest, summarise, format_blotter
+
+result = run_backtest(load_csv("bars_5m.csv"), BacktestConfig(entry_window_minutes=30))
+print(format_blotter(result))
+print(summarise(result).profit_factor)
+
+# Single-day reference path
 from strategy import Candle, StrategyConfig, TICK_NSE_EQUITY, scan_4h, build_trade_plan
 
 cfg = StrategyConfig(tick_size=TICK_NSE_EQUITY)   # long_only=True by default
