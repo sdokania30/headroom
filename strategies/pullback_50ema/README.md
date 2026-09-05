@@ -1,133 +1,150 @@
-# 4H 50-EMA Pullback — Formalised Ruleset
+# 4H 50-EMA Pullback → RVOL → 10-Min HOD — Long Only
 
-Executable specification of the pullback/entry rules, the intraday RVOL execution
-filter and the Chandelier exit. Stdlib-only Python; no pandas, no numpy, no network.
+Two deliverables from one ruleset:
 
-```
-strategies/pullback_50ema/
-  strategy.py        indicators + the three gates
-  test_strategy.py   29 unit tests (unittest)
-  demo.py            synthetic end-to-end walkthrough
-```
-
-Run:
+| Path | What it is |
+|---|---|
+| `pine/rvol_hod_swing_long.pine` | **The tradeable strategy.** Pine Script v6, long only, for a 5-minute chart. |
+| `strategy.py` | Reference implementation of the same logic in Python — the executable spec the Pine was derived from. |
+| `test_strategy.py` | 32 unit tests of the reference implementation. |
+| `test_pine_parity.py` | 7 tests asserting the Pine state machine and the Python reference fire identically. |
+| `demo.py` | Synthetic end-to-end walkthrough. |
 
 ```bash
 cd strategies/pullback_50ema
-python3 -m unittest test_strategy -v
+python3 -m unittest test_strategy test_pine_parity -v
 python3 demo.py
 ```
 
 ---
 
-## 1. Rule → code mapping
+## 1. The Pine strategy
 
-| # | Source rule | Formalisation | Config knob | Code |
-|---|---|---|---|---|
-| 1 | Uptrend above / downtrend below the 4H 50 EMA | `close` on one side of EMA50 for N consecutive bars | `trend_confirm_bars = 3` | `scan_4h` run tracking |
-| 1b | "Initial separation" | peak `abs(close − EMA) / ATR` during the run ≥ threshold | `min_separation_atr = 1.0`, `atr_period = 14` | `run_max_sep` |
-| 2 | Pullback toward the EMA | ≥2 **consecutive** counter-trend candles (red in an uptrend, green in a downtrend); a doji ends the sequence | `min_pullback_bars = 2` | `Candle.is_counter_trend` |
-| 2b | Cancellation: "gone through the 50 EMA" | candle **body** entirely on the far side of the EMA → `CANCELLED_EMA_SLICE`. A close through the EMA that does not fully slice → `CANCELLED_TREND_FLIP` | — | `_slices_ema` |
-| 2c | "Must respect / bounce from the 50 EMA zone" | wick may pierce the EMA; optionally require the pullback to reach within `k × ATR` of it | `require_ema_touch = False`, `ema_zone_atr = 0.5` | `_touches_ema_zone` |
-| 3 | Entry 1 pip beyond the wick of the **first** counter-trend bar | LONG: `first_pullback.high + tick`; SHORT: `first_pullback.low − tick` | `tick_size`, `entry_anchor = "first"` | `_arm` |
-| 3b | "…or the lowest wick of that pullback sequence" | alternative anchor over the whole sequence | `entry_anchor = "extreme"` | `_arm` |
-| 4 | Daily cumulative RVOL ≥ 9% within the first 10 minutes | Σ volume of bars opening in `[open, open+10m)` ÷ 20-day ADV ≥ 0.09 | `threshold = 0.09`, `window_minutes = 10` | `evaluate_rvol_gate` |
-| 5 | Hold until an intraday candle closes below the Chandelier Exit | LONG: `HH(22) − 3×ATR(22)`, exit on `close < line`; SHORT mirrored | `period = 22`, `multiplier = 3.0`, `ratchet = True` | `find_chandelier_exit` |
+Apply to a **5-minute chart**. Long only. Positions are held as swings, across days.
 
-### Setup lifecycle
+### Entry — all three, inside the first 10 minutes of the session
 
-```
-        confirmed trend + separation
-                    │
-        first counter-trend candle
-                    │
-              [pullback open]  ──► body slices the EMA ──► CANCELLED_EMA_SLICE
-                    │            ──► close flips sides   ──► CANCELLED_TREND_FLIP
-                    │            ──► > max_pullback_bars ──► EXPIRED_PULLBACK_TOO_LONG
-          ≥2 counter-trend bars
-                    │
-                 [ARMED]  ── resting stop order at anchor ± 1 tick
-                    │
-        price trades through the level      no breakout within trigger_valid_bars
-                    │                                      │
-              TRIGGERED                          EXPIRED_NO_BREAKOUT
-```
+1. **4H setup live** (`useH4`, default on) — the 4H 50-EMA pullback is armed or has broken out within the last 6 bars.
+2. **RVOL gate** — cumulative session volume ≥ 9% of the 20-day ADV, latched on a completed bar inside the window.
+3. **10-min HOD** — a buy-stop 1 tick above the running high of day fills.
 
-The trigger is checked **before** the bar is classified, because a resting stop
-order fills intrabar — the bar that ends the pullback can be the bar that fills.
+### The consequence of a strict 10-minute window
 
----
+On a 5-minute chart the window holds exactly two bars:
 
-## 2. Resolved ambiguities
-
-The source rules are underspecified in seven places. Each was closed with an
-explicit, overridable assumption rather than left implicit.
-
-| Ambiguity | Assumption taken | Override |
+| Bar | Clock | What happens |
 |---|---|---|
-| "Slice completely through the EMA" — wick or body? | **Body**. A wick through the EMA is the bounce the setup wants; a body fully through is the cancel. | `_slices_ema` |
-| "Establish a trend" — how many bars? | 3 consecutive closes on one side of EMA50. | `trend_confirm_bars` |
-| "Initial separation" is unquantified | ≥1.0 × ATR(14) peak distance from the EMA during the run. Without this, any bar hugging the EMA qualifies. | `min_separation_atr` |
-| Entry anchor: "first counter-trend bar" **or** "lowest wick of the sequence" | Default to **first** (the primary instruction); `extreme` available. In practice they coincide, since the first pullback bar usually prints the sequence extreme. | `entry_anchor` |
-| "1 pip" is an FX unit; RVOL/market-open/Chandelier are equity concepts | `tick_size` is explicit. Presets: `TICK_FX_5DP` (0.0001), `TICK_FX_JPY` (0.01), `TICK_NSE_EQUITY` (0.05). | `tick_size` |
-| "RVOL ≥ 9%" — ratio or share? | Share of **20-day average daily volume**, not a classic RVOL ratio (a ratio would be expressed as ×, not %). | `threshold`, `average_daily_volume(lookback=…)` |
-| Chandelier parameters unstated | Chande's defaults: 22-period, 3× ATR, ratcheting. Exit on **close** through the line, per "an intraday candle closes below". | `period`, `multiplier`, `ratchet` |
+| 1 | 09:15–09:20 | Volume accumulates. If RVOL ≥ 9% at this close, the buy-stop is placed at bar 1's high + 1 tick. |
+| 2 | 09:20–09:25 | The order is live. A break of bar 1's high fills it. |
+| 3 | 09:25+ | Window shut. Any working order is cancelled. |
+
+So **the RVOL must breach on bar 1.** A breach at bar 2's close leaves no bar inside the window for a fill, and the day is skipped. That is the strict reading of "RVOL within 10 minutes" *and* "entry within 10 min HOD" together — the order is only ever placed while the next bar still opens inside the window (`orderMayWork`).
+
+If that proves too selective in backtest, the lever is `orMinutes`. At 15 you get two fillable bars, at 30 you get five. Nothing else needs to change.
+
+### Exit
+
+- **Chandelier Exit**, `HH(22) − 3 × ATR(22)`, exit on an intraday **close** below the line. Ratcheted by default.
+- **Initial ATR stop** at `entry − 1.5 × ATR`, intrabar, until the trail is meaningful.
+
+### Key inputs
+
+| Input | Default | Note |
+|---|---|---|
+| `sessTime` | `0915-1530` | NSE cash. Chart timezone must match. |
+| `orMinutes` | `10` | Entry window length. The main sensitivity knob. |
+| `rvolPct` | `9.0` | Share of 20-day ADV. |
+| `useH4` | `on` | Toggle the 4H filter to measure what it is worth. |
+| `chandTF` | `D` | **See below.** Empty string = chart timeframe. |
+| `eodExit` | `off` | This is a swing strategy. |
+
+### Why the Chandelier defaults to the daily timeframe
+
+`HH(22) − 3×ATR(22)` on a 5-minute chart is a 110-minute lookback. That is a day-trade stop — it will flush almost every position the same session and the "swing" never happens. The source rule says *"hold the swing position until an intraday candle closes below the Chandelier Exit"*, so the line is computed on the **daily** timeframe and tested against **every intraday close**. That is my reading, not something the source states. Set `chandTF` to `""` to get the literal chart-timeframe version and compare.
+
+### Repainting
+
+Every higher-timeframe read uses `barmerge.lookahead_off`. The 4H state machine runs at chart scope and advances only when a 4H bar has **closed**, using that closed bar's OHLC. The ADV uses `ta.sma(volume, 20)[1]`, excluding today's incomplete daily bar. Nothing reads a value that was not available at the time.
 
 ---
 
-## 3. Gaps in the source rules — decide these before risking capital
+## 2. Rule → code mapping
 
-1. **Direction contradiction.** The worked example is a **short**; the combined
-   execution section says "Enter **Long** on the RVOL breach". Both directions are
-   implemented symmetrically, but the intended live direction is unresolved. If
-   the strategy is equities-only (RVOL, market open, swing hold), shorts may not
-   be available at all — in which case Stage 1 should be restricted to LONG.
-2. **No initial stop is defined.** The Chandelier is a *trailing* exit and needs
-   ~22 bars before it prints; it does not protect the first minutes of the trade.
-   `Setup.protective_stop` supplies a placeholder (pullback extreme ± 1 tick) but
-   it is an addition, not part of the source ruleset.
-3. **No position sizing / risk-per-trade rule.** Nothing here sizes a position.
-4. **Timeframe mismatch is unhandled.** The setup lives on a 4H chart; the RVOL
-   gate lives on a specific session open. Which trading day counts as "the
-   breakout day" when the 4H trigger fires mid-session, or overnight, is not
-   specified. `build_trade_plan` takes the session open as an explicit argument
-   rather than guessing.
-5. **No trigger-level expiry in the source.** Defaulted to 3 bars
-   (`trigger_valid_bars`); a stale pending order is otherwise unbounded.
-6. **RVOL gate is a filter, not a signal.** "Enter on the RVOL breach" is
-   implemented as: the 4H level must be taken out *and* the gate must pass. The
-   fill price used is the 4H trigger level, not the price at the breach minute.
-7. **Unvalidated.** Every number here is a default, not a backtested parameter.
-   Nothing in this module has been run against real market data.
+| # | Source rule | Formalisation | Config knob |
+|---|---|---|---|
+| 1 | Uptrend above the 4H 50 EMA | `close` above EMA50 for N consecutive bars | `trendBars = 3` |
+| 1b | "Initial separation" | peak `abs(close − EMA) / ATR` during the run ≥ threshold | `sepATR = 1.0`, `atrLenH4 = 14` |
+| 2 | Pullback toward the EMA | ≥2 **consecutive** red candles; a doji ends the sequence | `minPB = 2` |
+| 2b | Cancellation: "gone through the 50 EMA" | candle **body** entirely below the EMA, or a close below it | — |
+| 2c | "Respect / bounce from the 50 EMA zone" | wicks may pierce the EMA freely | — |
+| 3 | Entry 1 pip above the first pullback bar's wick | `first_pullback.high + syminfo.mintick` | — |
+| 4 | Daily cumulative RVOL ≥ 9% in the first 10 minutes | Σ session volume ÷ 20-day ADV ≥ 0.09, latched inside the window | `rvolPct`, `advLen`, `orMinutes` |
+| 4b | Entry within the 10-min HOD | buy-stop 1 tick above the running HOD, working only while the next bar opens inside the window | `orMinutes` |
+| 5 | Hold until an intraday candle closes below the Chandelier Exit | `HH(22) − 3×ATR(22)` on the daily, tested on intraday closes | `chandTF`, `chandLen`, `chandMult` |
+
+### 4H setup lifecycle
+
+```
+        confirmed uptrend + >=1 ATR separation
+                        │
+             first red (counter-trend) candle
+                        │
+                  [pullback open] ──► body below the EMA   ──► cancelled
+                        │           ──► close below the EMA ──► cancelled
+                        │           ──► > maxPB red bars    ──► cancelled
+                  >=2 red bars
+                        │
+                    [ARMED]  ── buy-stop at first red bar's high + 1 tick
+                        │
+        high >= trigger                  no breakout within validBars
+                        │                             │
+               setup READY for                    cancelled
+             `validBars` more bars
+```
 
 ---
 
-## 4. Usage
+## 3. Resolved ambiguities
+
+The source rules were underspecified in eight places. Each is closed with an explicit, overridable choice.
+
+| Ambiguity | Choice taken | Override |
+|---|---|---|
+| Long or short? The worked example was a short, the execution section said long | **Long only.** Confirmed by you. The Python reference defaults to `long_only=True`; set `False` to scan shorts. | `StrategyConfig.long_only` |
+| "Slice completely through the EMA" — wick or body? | **Body.** A wick through the EMA is the bounce the setup wants; a body fully through cancels. | — |
+| "Establish a trend" — how many bars? | 3 consecutive closes above the EMA. | `trendBars` |
+| "Initial separation" is unquantified | ≥1.0 × ATR(14) peak distance. Without it, any bar hugging the EMA qualifies. | `sepATR` |
+| "1 pip" | `syminfo.mintick` in Pine. Python takes an explicit `tick_size`, presets `TICK_FX_5DP`, `TICK_FX_JPY`, `TICK_NSE_EQUITY`. | — |
+| "RVOL ≥ 9%" — ratio or share? | Share of **20-day ADV**. A ratio would be written as ×, not %. | `rvolPct`, `advLen` |
+| Chandelier parameters and timeframe unstated | Chande's defaults (22, 3×, ratcheting), computed on the **daily**, tested on intraday closes. | `chandTF`, `chandLen`, `chandMult`, `ratchet` |
+| No initial stop in the source ruleset | Added: `entry − 1.5 × ATR`, intrabar. The Chandelier is a trailing exit and does not protect the open of the trade. | `useInitStop`, `initATR` |
+
+---
+
+## 4. What is still open
+
+1. **Not compiled on TradingView.** The Pine has never been through the TV compiler — no TV access from this environment. The *logic* is verified: `test_pine_parity.py` transliterates the Pine state machine line-for-line and asserts it fires identical breakouts to the tested Python reference across 60 random walks of 400 bars (579 matching breakouts) plus six hand-built edge cases. Syntax is the remaining risk, and it is a paste-and-see.
+2. **Nothing is backtested.** Every number is a default, not a fitted parameter. No walk-forward, no parameter sweep, no out-of-sample split.
+3. **Position sizing is 100% of equity per trade.** Change `default_qty_type` / `default_qty_value` before this means anything about returns.
+4. **Commission 0.03% and 2-tick slippage** are placeholders. Set them to your actual costs — an opening-range strategy is slippage-sensitive and these assumptions move the equity curve materially.
+5. **`orMinutes = 10` is severe on a 5-min chart** (see §1). Backtest 10 / 15 / 30 before concluding the edge is absent.
+6. **Gap-up days are not handled specially.** If the stock gaps and bar 1 is a large range, the buy-stop sits above an already-extended high. Consider a max-extension filter.
+7. **The 4H bar boundary on NSE is awkward.** A 6h15m session does not divide into 4H bars cleanly. Verify what TradingView actually builds for your symbol before trusting `h4TF = 240`.
+
+---
+
+## 5. Python reference usage
 
 ```python
-from strategy import (
-    Candle, Direction, StrategyConfig, TICK_NSE_EQUITY,
-    scan_4h, average_daily_volume, evaluate_rvol_gate, find_chandelier_exit,
-    build_trade_plan,
-)
+from strategy import Candle, StrategyConfig, TICK_NSE_EQUITY, scan_4h, build_trade_plan
 
-cfg = StrategyConfig(tick_size=TICK_NSE_EQUITY)
+cfg = StrategyConfig(tick_size=TICK_NSE_EQUITY)   # long_only=True by default
 
-# Stage 1-3
 for setup in scan_4h(h4_candles, cfg):
     print(setup.direction, setup.status, setup.entry_price, setup.protective_stop)
 
-# Stage 4
-adv = average_daily_volume(daily_candles, lookback=20)
-gate = evaluate_rvol_gate(minute_candles, session_open, adv, threshold=0.09, window_minutes=10)
-
-# Stage 5
-exit_signal = find_chandelier_exit(minute_candles, Direction.LONG, entry_index=gate_index)
-
-# All three at once
 plan = build_trade_plan(h4_candles, minute_candles, session_open, adv, cfg)
-plan.executable  # triggered setup AND RVOL breach
+plan.executable   # triggered setup AND RVOL breach
 ```
 
-`Candle` is `(ts, open, high, low, close, volume)`; timestamps are treated as the
-bar's **open** time. Bring your own data source — this module never fetches.
+`Candle` is `(ts, open, high, low, close, volume)`; timestamps are the bar's **open** time. Bring your own data — this module never fetches.

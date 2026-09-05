@@ -85,6 +85,8 @@ class StrategyConfig:
     entry_anchor: str = "first"   # "first" = first counter-trend bar; "extreme" = whole sequence
     trigger_valid_bars: int = 3
     tick_size: float = TICK_FX_5DP
+    # -- Direction -----------------------------------------------------------
+    long_only: bool = True   # the live strategy is long-only; set False to scan shorts too
 
     def __post_init__(self) -> None:
         if self.entry_anchor not in ("first", "extreme"):
@@ -289,6 +291,8 @@ def scan_4h(candles: Sequence[Candle], config: Optional[StrategyConfig] = None) 
         if not trend_confirmed:
             continue
         direction = Direction.LONG if side == 1 else Direction.SHORT
+        if cfg.long_only and direction is Direction.SHORT:
+            continue
         if not c.is_counter_trend(direction) or _slices_ema(c, e, direction):
             continue
         active = Setup(

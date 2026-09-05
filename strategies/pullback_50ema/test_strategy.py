@@ -25,7 +25,7 @@ from strategy import (
 
 T0 = datetime(2026, 1, 5, 1, 0)
 BAR = timedelta(hours=4)
-CFG = StrategyConfig(tick_size=0.01)
+CFG = StrategyConfig(tick_size=0.01, long_only=False)
 
 
 def bar(i: int, open_: float, close: float, wick: float = 1.0, volume: float = 1000.0) -> Candle:
@@ -123,13 +123,13 @@ class LongSetupTests(unittest.TestCase):
         candles = list(uptrend())
         candles.append(bar(80, 181.0, 178.0, wick=1.0))    # high 182.0
         candles.append(bar(81, 179.0, 177.0, wick=6.0))    # high 185.0
-        first = scan_4h(candles, StrategyConfig(tick_size=0.01, entry_anchor="first"))[-1]
-        extreme = scan_4h(candles, StrategyConfig(tick_size=0.01, entry_anchor="extreme"))[-1]
+        first = scan_4h(candles, StrategyConfig(tick_size=0.01, entry_anchor="first", long_only=False))[-1]
+        extreme = scan_4h(candles, StrategyConfig(tick_size=0.01, entry_anchor="extreme", long_only=False))[-1]
         self.assertAlmostEqual(first.entry_price, 182.01)
         self.assertAlmostEqual(extreme.entry_price, 185.01)
 
     def test_pullback_longer_than_max_expires(self):
-        cfg = StrategyConfig(tick_size=0.01, max_pullback_bars=3)
+        cfg = StrategyConfig(tick_size=0.01, max_pullback_bars=3, long_only=False)
         candles = extend(
             uptrend(), (181.0, 180.0), (180.0, 179.0), (179.0, 178.0), (178.0, 177.0)
         )
@@ -137,7 +137,7 @@ class LongSetupTests(unittest.TestCase):
         self.assertIs(setup.status, SetupStatus.EXPIRED_PULLBACK_TOO_LONG)
 
     def test_trigger_expires_without_a_breakout(self):
-        cfg = StrategyConfig(tick_size=0.01, trigger_valid_bars=2)
+        cfg = StrategyConfig(tick_size=0.01, trigger_valid_bars=2, long_only=False)
         candles = extend(
             uptrend(),
             (181.0, 178.0),
@@ -150,11 +150,26 @@ class LongSetupTests(unittest.TestCase):
         self.assertIs(setup.status, SetupStatus.EXPIRED_NO_BREAKOUT)
 
     def test_require_ema_touch_withholds_the_trigger(self):
-        cfg = StrategyConfig(tick_size=0.01, require_ema_touch=True)
+        cfg = StrategyConfig(tick_size=0.01, require_ema_touch=True, long_only=False)
         candles = extend(uptrend(), (181.0, 178.0), (178.0, 176.0))
         setup = scan_4h(candles, cfg)[-1]
         self.assertFalse(setup.touched_ema_zone)
         self.assertIsNone(setup.entry_price)
+
+
+class LongOnlyTests(unittest.TestCase):
+    def test_long_only_is_the_default(self):
+        self.assertTrue(StrategyConfig().long_only)
+
+    def test_long_only_suppresses_short_setups(self):
+        candles = extend(downtrend(), (119.0, 122.0), (122.0, 124.0))
+        self.assertEqual(scan_4h(candles, StrategyConfig(tick_size=0.01)), [])
+        self.assertEqual(len(scan_4h(candles, CFG)), 1)
+
+    def test_long_only_still_finds_long_setups(self):
+        candles = extend(uptrend(), (181.0, 178.0), (178.0, 176.0))
+        setup = scan_4h(candles, StrategyConfig(tick_size=0.01))[-1]
+        self.assertIs(setup.direction, Direction.LONG)
 
 
 class ShortSetupTests(unittest.TestCase):

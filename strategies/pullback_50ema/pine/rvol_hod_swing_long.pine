@@ -1,0 +1,295 @@
+//@version=6
+// =============================================================================
+// RVOL 10-Min HOD Swing — Long Only
+// -----------------------------------------------------------------------------
+// Apply to a 5-MINUTE chart.
+//
+// Entry (all three must hold, inside the first `orMinutes` of the session):
+//   1. Optional 4H 50-EMA pullback setup is live (trend + separation + >=2
+//      counter-trend bars that respect the EMA + breakout of the first
+//      pullback bar's high).
+//   2. Cumulative session volume >= `rvolPct`% of the 20-day average daily
+//      volume -- the RVOL gate, latched on a completed bar inside the window.
+//   3. Price takes out the running high of day: a buy-stop 1 tick above the
+//      HOD of the bars completed so far in the window.
+//
+// The order is placed only while the NEXT bar still opens inside the window,
+// so on a 5-min chart with a 10-min window the RVOL must latch on bar 1 and
+// the fill happens on bar 2. Miss it and the day is skipped by design.
+//
+// Exit: an intraday close through the Chandelier Exit line (computed on the
+// daily timeframe by default -- see the note on `chandTF`), plus an optional
+// ATR initial stop that covers the trade before the trail is meaningful.
+//
+// Non-repainting: every higher-timeframe value is fetched with
+// barmerge.lookahead_off, and the 4H state machine is advanced only when a 4H
+// bar has CLOSED, using that closed bar's OHLC.
+// =============================================================================
+
+strategy("RVOL 10-Min HOD Swing (Long)", shorttitle="RVOL-ORH Long", overlay=true,
+     initial_capital        = 1000000,
+     default_qty_type       = strategy.percent_of_equity,
+     default_qty_value      = 100,
+     pyramiding             = 0,
+     margin_long            = 100,
+     commission_type        = strategy.commission.percent,
+     commission_value       = 0.03,
+     slippage               = 2,
+     calc_on_every_tick     = false,
+     process_orders_on_close = false)
+
+// ----------------------------------------------------------------------------
+// Inputs
+// ----------------------------------------------------------------------------
+gSess = "Session & entry window"
+sessTime  = input.session("0915-1530", "Regular session", group = gSess,
+     tooltip = "NSE cash is 0915-1530 IST. Set the chart timezone to match.")
+orMinutes = input.int(10, "Entry window from the open (minutes)", minval = 1, maxval = 240, group = gSess,
+     tooltip = "The order may only be WORKING inside this window. On a 5-min chart a 10-min window leaves exactly one fillable bar.")
+
+gRvol = "RVOL gate"
+advLen  = input.int(20, "ADV lookback (days)", minval = 1, group = gRvol)
+rvolPct = input.float(9.0, "Cumulative volume as % of ADV", minval = 0.1, step = 0.5, group = gRvol,
+     tooltip = "Session volume accumulated so far, as a share of the 20-day average daily volume.")
+
+gH4 = "4H 50-EMA pullback filter"
+useH4     = input.bool(true, "Require the 4H pullback setup", group = gH4)
+h4TF      = input.timeframe("240", "Setup timeframe", group = gH4)
+emaLen    = input.int(50, "EMA length", minval = 1, group = gH4)
+atrLenH4  = input.int(14, "ATR length", minval = 1, group = gH4)
+trendBars = input.int(3, "Bars to confirm the trend", minval = 1, group = gH4)
+sepATR    = input.float(1.0, "Minimum separation from EMA (x ATR)", minval = 0.0, step = 0.1, group = gH4)
+minPB     = input.int(2, "Minimum counter-trend bars", minval = 1, group = gH4)
+maxPB     = input.int(6, "Maximum counter-trend bars", minval = 1, group = gH4)
+validBars = input.int(6, "Setup stays valid for (4H bars)", minval = 1, group = gH4,
+     tooltip = "Applies to both an armed-but-unfilled trigger and a setup that has already broken out.")
+
+gExit = "Exit"
+chandTF     = input.timeframe("D", "Chandelier timeframe", group = gExit,
+     tooltip = "Leave on D for a swing trail. 22 bars on a 5-min chart is 110 minutes, which is a day-trade stop, not a swing stop. Set to an empty string to use the chart timeframe.")
+chandLen    = input.int(22, "Chandelier lookback", minval = 1, group = gExit)
+chandMult   = input.float(3.0, "Chandelier ATR multiple", minval = 0.1, step = 0.1, group = gExit)
+ratchet     = input.bool(true, "Ratchet the trail (never let it fall)", group = gExit)
+useInitStop = input.bool(true, "Initial ATR stop", group = gExit)
+initATR     = input.float(1.5, "Initial stop (x ATR)", minval = 0.1, step = 0.1, group = gExit)
+eodExit     = input.bool(false, "Force flat at the session close", group = gExit,
+     tooltip = "Off by default. This is a swing strategy; positions are meant to be held overnight.")
+
+gViz = "Display"
+showEma    = input.bool(true,  "Plot the 4H 50 EMA", group = gViz)
+showLevels = input.bool(true,  "Plot the entry stop and the trail", group = gViz)
+showTable  = input.bool(true,  "Show the status table", group = gViz)
+
+// ----------------------------------------------------------------------------
+// Session bookkeeping
+// ----------------------------------------------------------------------------
+inSess  = not na(time(timeframe.period, sessTime))
+newSess = inSess and not inSess[1]
+tfMins  = timeframe.in_seconds(timeframe.period) / 60.0
+
+var int   sessOpenTime = na
+var float cumVol       = na
+var float hod          = na
+var bool  rvolOK       = false
+var bool  tradedToday  = false
+
+if newSess
+    sessOpenTime := time
+    cumVol       := 0.0
+    hod          := na
+    rvolOK       := false
+    tradedToday  := false
+
+if inSess
+    cumVol := nz(cumVol) + volume
+    hod    := na(hod) ? high : math.max(hod, high)
+
+// Minutes from the session open to THIS bar's open.
+minsFromOpen = inSess and not na(sessOpenTime) ? (time - sessOpenTime) / 60000.0 : na
+inWindow     = inSess and not na(minsFromOpen) and minsFromOpen < orMinutes
+// True only while the NEXT bar also opens inside the window, i.e. while a
+// resting order still has somewhere legal to fill.
+orderMayWork = inWindow and (minsFromOpen + tfMins) < orMinutes
+
+// ----------------------------------------------------------------------------
+// RVOL gate: cumulative session volume as a share of the 20-day ADV
+// ----------------------------------------------------------------------------
+// [1] excludes today's own (incomplete) daily bar from the average.
+adv = request.security(syminfo.tickerid, "D", ta.sma(volume, advLen)[1], lookahead = barmerge.lookahead_off)
+
+rvolShare = na(adv) or adv <= 0 ? na : nz(cumVol) / adv
+if inWindow and not na(rvolShare) and rvolShare >= rvolPct / 100.0
+    rvolOK := true
+
+// ----------------------------------------------------------------------------
+// 4H 50-EMA pullback state machine (long side only)
+// ----------------------------------------------------------------------------
+// Simple built-ins only inside request.security; the state machine itself runs
+// at chart scope and steps forward once per CLOSED 4H bar.
+[h4Time, h4Open, h4High, h4Close, h4Ema, h4Atr] = request.security(syminfo.tickerid, h4TF,
+     [time, open, high, close, ta.ema(close, emaLen), ta.atr(atrLenH4)],
+     lookahead = barmerge.lookahead_off)
+
+newH4 = ta.change(h4Time) != 0
+
+var int   runSide     = 0     // +1 closing above the EMA, -1 below
+var int   runLen      = 0
+var float runSep      = 0.0   // peak |close - ema| / ATR reached during the run
+var int   pbCount     = 0     // consecutive counter-trend bars in the live pullback
+var float pbFirstHigh = na
+var float h4Trigger   = na    // armed breakout level
+var int   sinceArm    = 0
+var int   sinceTrig   = na    // 4H bars since the last breakout
+var bool  h4Ready     = false
+
+// The bar that just closed is the previous chart-bar's view of the HTF series.
+if newH4 and not na(h4Close[1]) and not na(h4Ema[1]) and not na(h4Atr[1]) and h4Atr[1] > 0
+    float o = h4Open[1]
+    float h = h4High[1]
+    float c = h4Close[1]
+    float e = h4Ema[1]
+    float a = h4Atr[1]
+
+    int side     = c > e ? 1 : c < e ? -1 : 0
+    int prevSide = runSide
+    if side != 0 and side == runSide
+        runLen += 1
+    else
+        runSide := side
+        runLen  := side != 0 ? 1 : 0
+        runSep  := 0.0
+    if side != 0
+        runSep := math.max(runSep, math.abs(c - e) / a)
+    bool flippedDown = side == -1 and prevSide == 1
+
+    bool fired = false
+    bool kill  = false
+
+    if not na(h4Trigger) and h >= h4Trigger
+        // Breakout of the pullback: a resting stop fills intrabar.
+        fired := true
+        kill  := true
+    else if flippedDown
+        // Closed to the wrong side of the 50 EMA.
+        kill := true
+    else if c < o
+        // Counter-trend (red) bar inside the uptrend.
+        if math.max(o, c) < e
+            // Body entirely below the EMA -- "gone through the 50 EMA, cancelled".
+            kill := true
+        else
+            if pbCount == 0
+                if runSide == 1 and runLen >= trendBars and runSep >= sepATR
+                    pbCount     := 1
+                    pbFirstHigh := h
+            else
+                pbCount += 1
+            if pbCount > maxPB
+                kill := true
+            else if pbCount >= minPB and not na(pbFirstHigh)
+                h4Trigger := pbFirstHigh + syminfo.mintick
+                sinceArm  := 0
+    else
+        // Trend-direction bar: the counter-trend sequence is over.
+        if pbCount > 0 and na(h4Trigger)
+            pbCount     := 0
+            pbFirstHigh := na
+        else if not na(h4Trigger)
+            sinceArm += 1
+            if sinceArm > validBars
+                kill := true
+
+    if kill
+        pbCount     := 0
+        pbFirstHigh := na
+        h4Trigger   := na
+        sinceArm    := 0
+
+    if fired
+        sinceTrig := 0
+    else if not na(sinceTrig)
+        sinceTrig := sinceTrig + 1
+
+    h4Ready := (not na(h4Trigger)) or (not na(sinceTrig) and sinceTrig <= validBars)
+
+h4Gate = not useH4 or h4Ready
+
+// ----------------------------------------------------------------------------
+// Entry: buy-stop 1 tick above the running high of day, inside the window
+// ----------------------------------------------------------------------------
+entryStop = na(hod) ? na : hod + syminfo.mintick
+canWork   = orderMayWork and rvolOK and h4Gate and strategy.position_size == 0 and not tradedToday and not na(entryStop)
+
+if canWork
+    strategy.entry("Long", strategy.long, stop = entryStop, comment = "RVOL+HOD")
+else
+    strategy.cancel("Long")
+
+justEntered = strategy.position_size > 0 and strategy.position_size[1] == 0
+if justEntered
+    tradedToday := true
+
+// ----------------------------------------------------------------------------
+// Exit: Chandelier close-through, plus an optional ATR initial stop
+// ----------------------------------------------------------------------------
+[chandRaw, atrExit] = request.security(syminfo.tickerid, chandTF == "" ? timeframe.period : chandTF,
+     [ta.highest(high, chandLen) - chandMult * ta.atr(chandLen), ta.atr(chandLen)],
+     lookahead = barmerge.lookahead_off)
+
+var float trail    = na
+var float initStop = na
+
+if justEntered
+    trail    := chandRaw
+    initStop := useInitStop and not na(atrExit) ? strategy.position_avg_price - initATR * atrExit : na
+else if strategy.position_size > 0
+    trail := na(trail) ? chandRaw : (ratchet ? math.max(trail, chandRaw) : chandRaw)
+else
+    trail    := na
+    initStop := na
+
+if strategy.position_size > 0
+    if not na(initStop)
+        strategy.exit("Init stop", from_entry = "Long", stop = initStop)
+    if not na(trail) and close < trail
+        strategy.close("Long", comment = "Chandelier")
+    else if eodExit and session.islastbar
+        strategy.close("Long", comment = "EOD")
+
+// ----------------------------------------------------------------------------
+// Display
+// ----------------------------------------------------------------------------
+plot(showEma ? h4Ema : na, "4H 50 EMA", color.new(color.orange, 0), linewidth = 2)
+plot(showLevels and canWork ? entryStop : na, "Entry stop", color.new(color.teal, 0),
+     style = plot.style_linebr, linewidth = 2)
+plot(showLevels and strategy.position_size > 0 ? trail : na, "Chandelier", color.new(color.red, 0),
+     style = plot.style_linebr, linewidth = 2)
+plot(showLevels and strategy.position_size > 0 ? initStop : na, "Initial stop", color.new(color.maroon, 40),
+     style = plot.style_linebr)
+
+bgcolor(inWindow ? color.new(color.blue, 92) : na, title = "Entry window")
+bgcolor(inWindow and rvolOK ? color.new(color.green, 82) : na, title = "RVOL breached")
+
+plotshape(justEntered, "Entry", shape.triangleup, location.belowbar, color.new(color.teal, 0), size = size.tiny)
+
+var table info = table.new(position.top_right, 2, 5, border_width = 1)
+if showTable and barstate.islast
+    table.cell(info, 0, 0, "RVOL (session / ADV)", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 0, na(rvolShare) ? "n/a" : str.tostring(rvolShare * 100, "#.##") + "%",
+         text_size = size.small, bgcolor = rvolOK ? color.new(color.green, 70) : color.new(color.red, 80))
+    table.cell(info, 0, 1, "Threshold", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 1, str.tostring(rvolPct, "#.##") + "%", text_size = size.small)
+    table.cell(info, 0, 2, "4H setup", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 2, not useH4 ? "off" : h4Ready ? "ready" : "none", text_size = size.small,
+         bgcolor = h4Gate ? color.new(color.green, 70) : color.new(color.red, 80))
+    table.cell(info, 0, 3, "4H trigger", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 3, na(h4Trigger) ? "-" : str.tostring(h4Trigger, format.mintick), text_size = size.small)
+    table.cell(info, 0, 4, "Entry window", text_halign = text.align_left, text_size = size.small)
+    table.cell(info, 1, 4, inWindow ? "open" : "closed", text_size = size.small)
+
+// ----------------------------------------------------------------------------
+// Alerts
+// ----------------------------------------------------------------------------
+alertcondition(canWork and not canWork[1], "Order working",
+     "RVOL gate passed and the buy-stop is working above the high of day.")
+alertcondition(justEntered, "Long entry filled", "Long filled on the 10-minute HOD breakout.")
